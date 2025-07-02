@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import sys
+import re
+import argparse
+
+def parse_burp_request_file(file_path):
+    with open(file_path, 'r') as f:
+        lines = f.read().splitlines()
+
+    # Extract method, path, and HTTP version
+    request_line = lines[0]
+    method, path, _ = request_line.split()
+
+    # Parse headers and body
+    headers = {}
+    body = ''
+    in_body = False
+    for line in lines[1:]:
+        if line.strip() == '':
+            in_body = True
+            continue
+        if in_body:
+            body += line
+        else:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+    return method, path, headers, body
+
+def build_wfuzz_command(method, path, headers, body, base_url, wordlist_file, filters):
+    # Identify FUZZ placeholders
+    fuzz_locations = []
+
+    if 'FUZZ' in path:
+        fuzz_locations.append('path')
+
+    header_fuzz = {}
+    for hname, hval in headers.items():
+        if 'FUZZ' in hval:
+            header_fuzz[hname] = hval
+            fuzz_locations.append(f'header:{hname}')
+
+    body_fuzz = None
+    if 'FUZZ' in body:
+        body_fuzz = body
+        fuzz_locations.append('body')
+
+    # Count number of FUZZ occurrences
+    fuzz_count = sum([
+        path.count('FUZZ'),
+        sum(v.count('FUZZ') for v in header_fuzz.values()),
+        body.count('FUZZ') if body_fuzz else 0
+    ])
+
+    # Construct wfuzz payloads
+    payloads = ' -z ' + ' -z '.join([f'file,{wordlist_file}'] * fuzz_count)
+
+    cmd = f"wfuzz{payloads} -X {method}"
+
+    if filters.get('hl'):
+        cmd += f' --hl {filters["hl"]}'
+    if filters.get('hh'):
+        cmd += f' --hh {filters["hh"]}'
+    if filters.get('sc'):
+        cmd += f' --sc {filters["sc"]}'
+    if filters.get('hc'):
+        cmd += f' --hc {filters["hc"]}'
+
+    for hname, hval in headers.items():
+        if 'FUZZ' in hval:
+            cmd += f' -H "{hname}: {hval}"'
+        else:
+            cmd += f' -H "{hname}: {hval}"'
+
+    if body:
+        safe_body = body.replace('"', '\\"')
+        cmd += f' -d "{safe_body}"'
+
+    full_url = base_url.rstrip("/") + path
+    cmd += f' "{full_url}"'
+
+    return cmd
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convert Burp request to wfuzz command.")
+    parser.add_argument("request_file", help="Burp-style HTTP request file")
+    parser.add_argument("base_url", help="Base URL like https://example.com")
+    parser.add_argument("wordlist_file", help="Wordlist for fuzzing")
+
+    # Optional filters
+    parser.add_argument("--hl", type=int, help="Hide responses with the given length")
+    parser.add_argument("--hh", type=int, help="Show only responses with the given length")
+    parser.add_argument("--sc", type=str, help="Show only responses with status code(s), e.g., 200,301")
+    parser.add_argument("--hc", type=str, help="Hide responses with status code(s), e.g., 404")
+    parser.add_argument("--dr", type=str, help="Only print the command, dont run.")
+
+
+    args = parser.parse_args()
+
+    method, path, headers, body = parse_burp_request_file(args.request_file)
+    filters = {
+        'hl': args.hl,
+        'hh': args.hh,
+        'sc': args.sc,
+        'hc': args.hc
+    }
+
+    wfuzz_cmd = build_wfuzz_command(method, path, headers, body, args.base_url, args.wordlist_file, filters)
+
+    print("\n🔥 Generated wfuzz command:\n")
+    if args.dr:
+        print("\n🔥 Dry run mode enabled, command not executed.")
+        print(wfuzz_cmd)
+    else:
+        print("\n🔥 Executing command...")
+        print(wfuzz_cmd)
+        import os
+        os.system(wfuzz_cmd)
