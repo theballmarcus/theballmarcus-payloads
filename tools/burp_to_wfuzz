@@ -2,6 +2,40 @@
 import sys
 import re
 import argparse
+import string
+import os
+import subprocess
+import json
+
+def to_ansi_c_quoted_string(s):
+    res = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+
+        if c == '\r' and i+1 < len(s) and s[i+1] == '\n':
+            res.append('\\x0d\\x0a')
+            i += 2
+            continue
+
+        if c == '\n':
+            res.append('\\x0d\\x0a')
+            i += 1
+            continue
+
+        # Safe printable ASCII characters except backslash and single quote
+        if 32 <= ord(c) <= 126 and c not in ("\\", "'"):
+            res.append(c)
+        else:
+            if c == '\\':
+                res.append('\\\\')
+            elif c == "'":
+                res.append("\\'")
+            else:
+                res.append(f'\\x{ord(c):02x}')
+        i += 1
+    return "$'" + ''.join(res) + "'"
+
 
 def parse_burp_request_file(file_path):
     with open(file_path, 'r') as f:
@@ -20,14 +54,31 @@ def parse_burp_request_file(file_path):
             in_body = True
             continue
         if in_body:
-            body += line
+            body += line + '\r\n'
         else:
             if ':' in line:
                 k, v = line.split(':', 1)
                 headers[k.strip()] = v.strip()
     return method, path, headers, body
 
-def build_wfuzz_command(method, path, headers, body, base_url, wordlist_file, filters):
+def build_wfuzz_command(method, path, headers, body, args):
+    filters = {
+        'hl': args.hl,
+        'hh': args.hh,
+        'sc': args.sc,
+        'hc': args.hc
+    }
+
+    wordlist = None
+    if args.w:
+        wordlist = f'file,{args.w}'
+    elif args.r:
+        wordlist = f'range,1-{args.r}'
+    elif args.guess_word:
+        wordlist = 'file,/tmp/printables.txt'
+        with open('/tmp/printables.txt', 'w') as f:
+            f.write('\n'.join([c for c in string.printable if c.isprintable()]))
+
     # Identify FUZZ placeholders
     fuzz_locations = []
 
@@ -51,11 +102,13 @@ def build_wfuzz_command(method, path, headers, body, base_url, wordlist_file, fi
         sum(v.count('FUZZ') for v in header_fuzz.values()),
         body.count('FUZZ') if body_fuzz else 0
     ])
-
-    # Construct wfuzz payloads
-    payloads = ' -z ' + ' -z '.join([f'file,{wordlist_file}'] * fuzz_count)
+        
+    payloads = ' -z ' + ' -z '.join([f'{wordlist}'] * fuzz_count)
 
     cmd = f"wfuzz{payloads} -X {method}"
+
+    if args.v:
+        cmd += " -v"
 
     if filters.get('hl'):
         cmd += f' --hl {filters["hl"]}'
@@ -66,17 +119,27 @@ def build_wfuzz_command(method, path, headers, body, base_url, wordlist_file, fi
     if filters.get('hc'):
         cmd += f' --hc {filters["hc"]}'
 
+    if args.ss:
+        cmd += f' --ss "{args.ss}"'
+
+    if args.hs:
+        cmd += f' --hs "{args.hs}"'
+
     for hname, hval in headers.items():
         if 'FUZZ' in hval:
             cmd += f' -H "{hname}: {hval}"'
         else:
             cmd += f' -H "{hname}: {hval}"'
 
-    if body:
-        safe_body = body.replace('"', '\\"')
-        cmd += f' -d "{safe_body}"'
+    if args.guess_word:
+        cmd += ' -o json'
 
-    full_url = base_url.rstrip("/") + path
+    if body:
+        print(body)
+        safe_body = to_ansi_c_quoted_string(body)
+        cmd += f' -d {safe_body}'
+
+    full_url = args.base_url.rstrip("/") + path
     cmd += f' "{full_url}"'
 
     return cmd
@@ -85,34 +148,53 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Burp request to wfuzz command.")
     parser.add_argument("request_file", help="Burp-style HTTP request file")
     parser.add_argument("base_url", help="Base URL like https://example.com")
-    parser.add_argument("wordlist_file", help="Wordlist for fuzzing")
 
     # Optional filters
+    parser.add_argument("-r", type=int, help="Wordlist file for fuzzing")
+    parser.add_argument("-w", type=str, help="Wordlist for fuzzing")
     parser.add_argument("--hl", type=int, help="Hide responses with the given length")
     parser.add_argument("--hh", type=int, help="Show only responses with the given length")
     parser.add_argument("--sc", type=str, help="Show only responses with status code(s), e.g., 200,301")
     parser.add_argument("--hc", type=str, help="Hide responses with status code(s), e.g., 404")
-    parser.add_argument("--dr", type=str, help="Only print the command, dont run.")
 
+    parser.add_argument("--ss", type=str, help="String that Wfuzz should look for in the response to consider it a success")
+    parser.add_argument("--hs", type=str, help="String that Wfuzz should look for in the response to consider it a failure")
+
+    parser.add_argument("--dr", action="store_true", help="Only print the command, dont run.")
+    parser.add_argument("-v", action="store_true", help="Only print the command, dont run.")
+    parser.add_argument("--guess_word", action="store_true", help="Guesses word character by character")
 
     args = parser.parse_args()
 
     method, path, headers, body = parse_burp_request_file(args.request_file)
-    filters = {
-        'hl': args.hl,
-        'hh': args.hh,
-        'sc': args.sc,
-        'hc': args.hc
-    }
-
-    wfuzz_cmd = build_wfuzz_command(method, path, headers, body, args.base_url, args.wordlist_file, filters)
+    
+    wfuzz_cmd = build_wfuzz_command(method, path, headers, body, args)
 
     print("\n🔥 Generated wfuzz command:\n")
+    print(wfuzz_cmd)
+
     if args.dr:
         print("\n🔥 Dry run mode enabled, command not executed.")
-        print(wfuzz_cmd)
     else:
+
         print("\n🔥 Executing command...")
-        print(wfuzz_cmd)
-        import os
-        os.system(wfuzz_cmd)
+        if args.guess_word:            
+            # os.system(wfuzz_cmd)
+            output = []
+            process = subprocess.Popen(
+                wfuzz_cmd, shell=True, executable='/bin/bash',
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+
+            for line in process.stdout:
+                if line.strip() == "":
+                    continue
+                print(line)
+                try:
+                    resp = json.loads(line)
+                except Exception as e:
+                    print(e)
+                
+            process.wait()
+        else:
+            os.system(wfuzz_cmd)
