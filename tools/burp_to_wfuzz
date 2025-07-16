@@ -1,312 +1,242 @@
 #!/usr/bin/env python3
-import sys
-import re
-import argparse
-import string
-import os
-import subprocess
-import json
-from collections import defaultdict
-import pprint
+"""
+WFuzz Helper Tool
 
-def find_most_probable_character(data):
-    # Define safe characters (alphanumeric and common safe symbols)
-    SAFE_CHARS = set(
-        'abcdefghijklmnopqrstuvwxyz'
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        '0123456789'
-        '-_'
-    )
-    
-    pattern_counts = defaultdict(int)
-    
-    # Count occurrences of each response pattern
-    for entry in data:
-        pattern = (entry['chars'], entry['words'], entry['lines'])
-        pattern_counts[pattern] += 1
-    
+Converts a Burp-style HTTP request file into a wfuzz command
+and optionally performs character-by-character fuzzing.
+"""
+import argparse
+import json
+import os
+import string
+import subprocess
+from collections import Counter
+from typing import Any, Dict, List, Tuple
+
+# Safe characters for guessing
+SAFE_CHARS = set(string.ascii_letters + string.digits + '-_')
+
+
+def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Identify deviations from the majority response pattern to find probable characters.
+    Returns dict with 'safe_chars' and 'special_chars'.
+    """
+    pattern_counts = Counter((e['chars'], e['words'], e['lines']) for e in data)
     if not pattern_counts:
         return {'safe_chars': [], 'special_chars': []}
-    
-    # Find the most common pattern (majority)
-    majority_pattern = max(pattern_counts.items(), key=lambda x: x[1])[0]
-    
-    # Find entries that differ from majority pattern (successful responses only)
-    candidates = []
-    for entry in data:
-        if entry['code'] < 400:  # Only successful responses
-            current_pattern = (entry['chars'], entry['words'], entry['lines'])
-            if current_pattern != majority_pattern:
-                candidates.append(entry)
-    
-    # Prepare result dictionary
-    result = {
-        'safe_chars': [],
-        'special_chars': []
-    }
-    
-    if candidates:
-        # Calculate deviation score
-        majority_chars, majority_words, majority_lines = majority_pattern
-        for candidate in candidates:
-            deviation = (
-                abs(candidate['chars'] - majority_chars) +
-                abs(candidate['words'] - majority_words) +
-                abs(candidate['lines'] - majority_lines)
-            )
-            candidate['deviation'] = deviation
-        
-        # Sort by deviation (highest first)
-        candidates.sort(key=lambda x: x['deviation'], reverse=True)
-        
-        # Get max deviation
-        max_deviation = candidates[0]['deviation']
-        top_candidates = [c for c in candidates if c['deviation'] == max_deviation]
-        
-        # Categorize candidates
-        for candidate in top_candidates:
-            char = candidate['payload']
-            if char and char[0] in SAFE_CHARS and len(char) == 1:  # Check if first char is safe
-                result['safe_chars'].append({
-                    'char': char,
-                    'deviation': candidate['deviation'],
-                    'details': {
-                        'chars': candidate['chars'],
-                        'words': candidate['words'],
-                        'lines': candidate['lines']
-                    }
-                })
-            else:
-                result['special_chars'].append({
-                    'char': char,
-                    'deviation': candidate['deviation'],
-                    'details': {
-                        'chars': candidate['chars'],
-                        'words': candidate['words'],
-                        'lines': candidate['lines']
-                    }
-                })
-    
+    majority_pattern, _ = pattern_counts.most_common(1)[0]
+    deviations = []
+    for e in data:
+        if e.get('code', 0) < 400:
+            patt = (e['chars'], e['words'], e['lines'])
+            if patt != majority_pattern:
+                dev = sum(abs(a - b) for a, b in zip(patt, majority_pattern))
+                deviations.append((dev, e))
+    deviations.sort(key=lambda x: x[0], reverse=True)
+    result = {'safe_chars': [], 'special_chars': []}
+    if deviations:
+        max_dev = deviations[0][0]
+        for dev, e in deviations:
+            if dev != max_dev:
+                break
+            char = e.get('payload', '')
+            details = {'chars': e['chars'], 'words': e['words'], 'lines': e['lines'], 'deviation': dev}
+            key = 'safe_chars' if len(char) == 1 and char in SAFE_CHARS else 'special_chars'
+            result[key].append({'char': char, 'details': details})
     return result
 
-def to_ansi_c_quoted_string(s):
-    res = []
-    i = 0
+
+def to_ansi_c_quoted_string(s: str) -> str:
+    """Convert string to ANSI C quoted string for shell."""
+    parts, i = [], 0
     while i < len(s):
         c = s[i]
-
-        if c == '\r' and i+1 < len(s) and s[i+1] == '\n':
-            res.append('\\x0d\\x0a')
-            i += 2
-            continue
-
+        if c == '\r' and i + 1 < len(s) and s[i+1] == '\n':
+            parts.append('\\x0d\\x0a'); i += 2; continue
         if c == '\n':
-            res.append('\\x0d\\x0a')
-            i += 1
-            continue
-
-        # Safe printable ASCII characters except backslash and single quote
-        if 32 <= ord(c) <= 126 and c not in ("\\", "'"):
-            res.append(c)
+            parts.append('\\x0d\\x0a'); i += 1; continue
+        if 32 <= ord(c) <= 126 and c not in "\\'":
+            parts.append(c)
         else:
-            if c == '\\':
-                res.append('\\\\')
-            elif c == "'":
-                res.append("\\'")
-            else:
-                res.append(f'\\x{ord(c):02x}')
+            if c == '\\': parts.append('\\\\')
+            elif c == "'": parts.append("\\'")
+            else: parts.append(f"\\x{ord(c):02x}")
         i += 1
-    return "$'" + ''.join(res) + "'"
+    return "$'" + ''.join(parts) + "'"
 
-def parse_burp_request_file(file_path):
-    with open(file_path, 'r') as f:
+
+def parse_burp_request_file(path: str) -> Tuple[str, str, Dict[str, str], str]:
+    """Parse Burp HTTP request file into method, path, headers, body."""
+    with open(path, 'r') as f:
         lines = f.read().splitlines()
-
-    # Extract method, path, and HTTP version
-    request_line = lines[0]
-    method, path, _ = request_line.split()
-
-    # Parse headers and body
-    headers = {}
-    body = ''
-    in_body = False
+    method, req_path, _ = lines[0].split(maxsplit=2)
+    headers, body_lines, in_body = {}, [], False
     for line in lines[1:]:
-        if line.strip() == '':
+        if not in_body and not line.strip():
             in_body = True
             continue
         if in_body:
-            body += line + '\r\n'
+            body_lines.append(line)
         else:
             if ':' in line:
                 k, v = line.split(':', 1)
                 headers[k.strip()] = v.strip()
-    return method, path, headers, body
 
-def build_wfuzz_command(method, path, headers, body, args):
-    filters = {
-        'hl': args.hl,
-        'hh': args.hh,
-        'sc': args.sc,
-        'hc': args.hc
-    }
+    base_url = headers.get('Host', '').strip()
 
-    wordlist = None
+    body = '\r\n'.join(body_lines)
+    return method, req_path, headers, body, base_url
+
+
+def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> str:
+    """Construct wfuzz command from parsed request and CLI args."""
+    # Wordlist
     if args.w:
-        wordlist = f'file,{args.w}'
+        wl = f'file,{args.w}'
     elif args.r:
-        wordlist = f'range,1-{args.r}'
+        wl = f'range,1-{args.r}'
     elif args.guess_word:
-        wordlist = 'file,/tmp/printables.txt'
-        with open('/tmp/printables.txt', 'w') as f:
-            f.write('\n'.join([c for c in string.printable if c.isprintable()]))
+        tmp = '/tmp/printables.txt'
+        with open(tmp, 'w') as f:
+            f.write('\n'.join(c for c in string.printable if c.isprintable()))
+        wl = f'file,{tmp}'
+    else:
+        wl = ''
 
-    # Identify FUZZ placeholders
-    fuzz_locations = []
+    # Count FUZZ occurrences
+    cnt = path.count('FUZZ') + sum(v.count('FUZZ') for v in headers.values()) + (body.count('FUZZ') if body else 0)
+    if cnt == 0:
+        raise ValueError("No FUZZ placeholder found in request.")
+    payloads = ' '.join(['-z ' + wl] * cnt)
 
-    if 'FUZZ' in path:
-        fuzz_locations.append('path')
+    # Base command
+    parts = ['wfuzz', payloads, '-X', method]
 
-    header_fuzz = {}
-    for hname, hval in headers.items():
-        if 'FUZZ' in hval:
-            header_fuzz[hname] = hval
-            fuzz_locations.append(f'header:{hname}')
-
-    body_fuzz = None
-    if 'FUZZ' in body:
-        body_fuzz = body
-        fuzz_locations.append('body')
-
-    # Count number of FUZZ occurrences
-    fuzz_count = sum([
-        path.count('FUZZ'),
-        sum(v.count('FUZZ') for v in header_fuzz.values()),
-        body.count('FUZZ') if body_fuzz else 0
-    ])
-        
-    payloads = ' -z ' + ' -z '.join([f'{wordlist}'] * fuzz_count)
-
-    cmd = f"wfuzz{payloads} -X {method}"
-
-    if args.v:
-        cmd += " -v"
-
-    if filters.get('hl'):
-        cmd += f' --hl {filters["hl"]}'
-    if filters.get('hh'):
-        cmd += f' --hh {filters["hh"]}'
-    if filters.get('sc'):
-        cmd += f' --sc {filters["sc"]}'
-    if filters.get('hc'):
-        cmd += f' --hc {filters["hc"]}'
-
+    # Filters
+    for opt, flag in (('hl','--hl'),('hh','--hh'),('sc','--sc'),('hc','--hc')):
+        val = getattr(args, opt)
+        if val:
+            parts += [flag, str(val)]
     if args.ss:
-        cmd += f' --ss "{args.ss}"'
-
+        parts += ['--ss', args.ss]
     if args.hs:
-        cmd += f' --hs "{args.hs}"'
+        parts += ['--hs', args.hs]
 
-    for hname, hval in headers.items():
-        if 'FUZZ' in hval:
-            cmd += f' -H "{hname}: {hval}"'
-        else:
-            cmd += f' -H "{hname}: {hval}"'
+    # Headers (quoted)
+    for k, v in headers.items():
+        parts.append('-H')
+        parts.append(f'"{k}: {v}"')
 
-    if args.guess_word:
-        cmd += ' -o json'
-
+    # Body
     if body:
-        safe_body = to_ansi_c_quoted_string(body)
-        cmd += f' -d {safe_body}'
+        parts += ['-d', to_ansi_c_quoted_string(body)]
 
-    full_url = args.base_url.rstrip("/") + path
-    cmd += f' "{full_url}"'
+    # JSON output for guess mode
+    if args.guess_word:
+        parts.append('-o json')
 
-    return cmd
+    # URL
+    base = args.base_url.rstrip('/')
+    parts.append(f'"{base}{path}"')
 
-def guess_string(wfuzz_cmd, curGuess=""):
-    while True:                    
-        print("\n🔥 Executing command...")
-        print()
-        cur_wfuzz_cmd = wfuzz_cmd.replace('FUZZ', f'{curGuess}FUZZ')
+    return ' '.join(parts)
 
-        process = subprocess.Popen(
-            cur_wfuzz_cmd, shell=True, executable='/bin/bash',
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
 
-        for line in process.stdout:
-            if line.strip() == "":
+def guess_string(wfuzz_cmd: str) -> str:
+    """Guess a single string by iteratively finding one char at a time."""
+    result = ''
+    while True:
+        cmd = wfuzz_cmd.replace('FUZZ', f'{result}FUZZ')
+        if 'FIZZW' in cmd:
+            cmd = cmd.replace('FIZZW', f'{len(result)}')
+
+        print(f"\n🔥 Executing: \n{cmd}\n")
+        p = subprocess.Popen(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout or []:
+            if not line.strip():
                 continue
             try:
                 resp = json.loads(line)
                 chars = find_most_probable_character(resp)
-                print("Safe characters:", len(chars['safe_chars']))
                 if len(chars['safe_chars']) == 1:
-                    found_char = chars['safe_chars'][0]['char']
-                    curGuess += found_char
-                    print(f'Found char {found_char} at index {len(curGuess) - 1}. Current password: {curGuess}')
+                    ch = chars['safe_chars'][0]['char']
+                    result += ch
+                    print(f"Found '{ch}' -> {result}")
                 else:
-                    print('Manual inspecting required.')
-                    pprint.pprint(chars)
-                    return curGuess
-                
-            except Exception as e:
-                print(e)
-            
-        process.wait()
-    
-if __name__ == "__main__":
+                    print("Manual inspect:", chars)
+                    return result
+            except Exception:
+                print(line)
+        p.wait()
+    return result
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Convert Burp request to wfuzz command.")
-    parser.add_argument("request_file", help="Burp-style HTTP request file")
-    parser.add_argument("base_url", help="Base URL like https://example.com")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    run_parser = subparsers.add_parser("run", help="Payload-related operations")
+    run_parser.add_argument("request_file")
 
-    # Optional filters
-    parser.add_argument("-r", type=int, help="Wordlist file for fuzzing")
-    parser.add_argument("-w", type=str, help="Wordlist for fuzzing")
-    parser.add_argument("--hl", type=int, help="Hide responses with the given length")
-    parser.add_argument("--hh", type=int, help="Show only responses with the given length")
-    parser.add_argument("--sc", type=str, help="Show only responses with status code(s), e.g., 200,301")
-    parser.add_argument("--hc", type=str, help="Hide responses with status code(s), e.g., 404")
+    run_parser.add_argument("--base_url")
+    run_parser.add_argument("-w")
+    run_parser.add_argument("-r", type=int)
+    run_parser.add_argument("--hl", type=int)
+    run_parser.add_argument("--hh", type=int)
+    run_parser.add_argument("--sc")
+    run_parser.add_argument("--hc")
+    run_parser.add_argument("--ss")
+    run_parser.add_argument("--hs")
+    run_parser.add_argument("--https", action="store_true")
 
-    parser.add_argument("--ss", type=str, help="String that Wfuzz should look for in the response to consider it a success")
-    parser.add_argument("--hs", type=str, help="String that Wfuzz should look for in the response to consider it a failure")
-
-    parser.add_argument("--dr", action="store_true", help="Only print the command, dont run.")
-    parser.add_argument("-v", action="store_true", help="Only print the command, dont run.")
-    parser.add_argument("--guess_word", action="store_true", help="Guesses word character by character")
+    run_parser.add_argument("--guess-word", action="store_true")
+    run_parser.add_argument("--dr", action="store_true", help="Dry run: only print command")
+    run_parser.add_argument("-v", action="store_true", help="Dry run: only print command")
 
     args = parser.parse_args()
 
-    method, path, headers, body = parse_burp_request_file(args.request_file)
-    
-    wfuzz_cmd = build_wfuzz_command(method, path, headers, body, args)
+    if args.command == "run":
+        method, path, headers, body, base_url = parse_burp_request_file(args.request_file)
+        if not base_url and not args.base_url:
+            raise ValueError("Host header not found in request.")
+        else:
+            if not args.base_url:
+                if args.https:
+                    args.base_url = f"https://{base_url}"
+                else:
+                    args.base_url = f"http://{base_url}"
 
-    print("\n🔥 Generated wfuzz command:\n")
-    print(wfuzz_cmd)
+        cmd = build_wfuzz_command(method, path, headers, body, args)
 
-    if args.dr:
-        print("\n🔥 Dry run mode enabled, command not executed.")
-    else:
+        print(f"\n🔥 Generated wfuzz command:\n{cmd}\n")
+        if args.dr or args.v:
+            print("Dry run mode: command not executed.")
+            return
 
         if args.guess_word:
-            if 'FIZZ' in wfuzz_cmd:
+            # Support numeric guessing sequences if placeholder FIZZR
+            if 'FIZZR' in cmd:
                 results = []
                 i = 0
                 while True:
-                    cur_wfuzz_cmd = wfuzz_cmd.replace('FIZZ', f'{i}')
-                    curResult = guess_string(cur_wfuzz_cmd)
-                    if curResult == "":
-                        print('\nGuessed:\n')
-                        for result in range(len(results)):
-                            print(f"{result} :      {results[result]}")
-                        exit(0)
-                    else:
-                        results.append(curResult)
-                        i+=1
-
+                    cur_cmd = cmd.replace('FIZZR', str(i))
+                    res = guess_string(cur_cmd)
+                    if not res:
+                        print('\nGuessed results:')
+                        for idx, r in enumerate(results): print(f"{idx}: {r}")
+                        break
+                    results.append(res)
+                    i += 1
+            elif 'FIZZW' in cmd:
+                res = guess_string(cmd)
+                print(f"Guessed string: {res}")
             else:
-                guess_string(wfuzz_cmd)
-            
+                res = guess_string(cmd)
+                print(f"Guessed string: {res}")
         else:
-            os.system(wfuzz_cmd)
+            subprocess.run(cmd, shell=True, executable='/bin/bash')     
+            pass
+
+if __name__ == "__main__":
+    main()
