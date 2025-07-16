@@ -6,6 +6,88 @@ import string
 import os
 import subprocess
 import json
+from collections import defaultdict
+import pprint
+
+def find_most_probable_character(data):
+    # Define safe characters (alphanumeric and common safe symbols)
+    SAFE_CHARS = set(
+        'abcdefghijklmnopqrstuvwxyz'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        '0123456789'
+        '-_'
+    )
+    
+    pattern_counts = defaultdict(int)
+    
+    # Count occurrences of each response pattern
+    for entry in data:
+        pattern = (entry['chars'], entry['words'], entry['lines'])
+        pattern_counts[pattern] += 1
+    
+    if not pattern_counts:
+        return {'safe_chars': [], 'special_chars': []}
+    
+    # Find the most common pattern (majority)
+    majority_pattern = max(pattern_counts.items(), key=lambda x: x[1])[0]
+    
+    # Find entries that differ from majority pattern (successful responses only)
+    candidates = []
+    for entry in data:
+        if entry['code'] < 400:  # Only successful responses
+            current_pattern = (entry['chars'], entry['words'], entry['lines'])
+            if current_pattern != majority_pattern:
+                candidates.append(entry)
+    
+    # Prepare result dictionary
+    result = {
+        'safe_chars': [],
+        'special_chars': []
+    }
+    
+    if candidates:
+        # Calculate deviation score
+        majority_chars, majority_words, majority_lines = majority_pattern
+        for candidate in candidates:
+            deviation = (
+                abs(candidate['chars'] - majority_chars) +
+                abs(candidate['words'] - majority_words) +
+                abs(candidate['lines'] - majority_lines)
+            )
+            candidate['deviation'] = deviation
+        
+        # Sort by deviation (highest first)
+        candidates.sort(key=lambda x: x['deviation'], reverse=True)
+        
+        # Get max deviation
+        max_deviation = candidates[0]['deviation']
+        top_candidates = [c for c in candidates if c['deviation'] == max_deviation]
+        
+        # Categorize candidates
+        for candidate in top_candidates:
+            char = candidate['payload']
+            if char and char[0] in SAFE_CHARS and len(char) == 1:  # Check if first char is safe
+                result['safe_chars'].append({
+                    'char': char,
+                    'deviation': candidate['deviation'],
+                    'details': {
+                        'chars': candidate['chars'],
+                        'words': candidate['words'],
+                        'lines': candidate['lines']
+                    }
+                })
+            else:
+                result['special_chars'].append({
+                    'char': char,
+                    'deviation': candidate['deviation'],
+                    'details': {
+                        'chars': candidate['chars'],
+                        'words': candidate['words'],
+                        'lines': candidate['lines']
+                    }
+                })
+    
+    return result
 
 def to_ansi_c_quoted_string(s):
     res = []
@@ -35,7 +117,6 @@ def to_ansi_c_quoted_string(s):
                 res.append(f'\\x{ord(c):02x}')
         i += 1
     return "$'" + ''.join(res) + "'"
-
 
 def parse_burp_request_file(file_path):
     with open(file_path, 'r') as f:
@@ -135,7 +216,6 @@ def build_wfuzz_command(method, path, headers, body, args):
         cmd += ' -o json'
 
     if body:
-        print(body)
         safe_body = to_ansi_c_quoted_string(body)
         cmd += f' -d {safe_body}'
 
@@ -144,6 +224,38 @@ def build_wfuzz_command(method, path, headers, body, args):
 
     return cmd
 
+def guess_string(wfuzz_cmd, curGuess=""):
+    while True:                    
+        print("\n🔥 Executing command...")
+        print()
+        cur_wfuzz_cmd = wfuzz_cmd.replace('FUZZ', f'{curGuess}FUZZ')
+
+        process = subprocess.Popen(
+            cur_wfuzz_cmd, shell=True, executable='/bin/bash',
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+
+        for line in process.stdout:
+            if line.strip() == "":
+                continue
+            try:
+                resp = json.loads(line)
+                chars = find_most_probable_character(resp)
+                print("Safe characters:", len(chars['safe_chars']))
+                if len(chars['safe_chars']) == 1:
+                    found_char = chars['safe_chars'][0]['char']
+                    curGuess += found_char
+                    print(f'Found char {found_char} at index {len(curGuess) - 1}. Current password: {curGuess}')
+                else:
+                    print('Manual inspecting required.')
+                    pprint.pprint(chars)
+                    return curGuess
+                
+            except Exception as e:
+                print(e)
+            
+        process.wait()
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Burp request to wfuzz command.")
     parser.add_argument("request_file", help="Burp-style HTTP request file")
@@ -177,24 +289,24 @@ if __name__ == "__main__":
         print("\n🔥 Dry run mode enabled, command not executed.")
     else:
 
-        print("\n🔥 Executing command...")
-        if args.guess_word:            
-            # os.system(wfuzz_cmd)
-            output = []
-            process = subprocess.Popen(
-                wfuzz_cmd, shell=True, executable='/bin/bash',
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-            )
+        if args.guess_word:
+            if 'FIZZ' in wfuzz_cmd:
+                results = []
+                i = 0
+                while True:
+                    cur_wfuzz_cmd = wfuzz_cmd.replace('FIZZ', f'{i}')
+                    curResult = guess_string(cur_wfuzz_cmd)
+                    if curResult == "":
+                        print('\nGuessed:\n')
+                        for result in range(len(results)):
+                            print(f"{result} :      {results[result]}")
+                        exit(0)
+                    else:
+                        results.append(curResult)
+                        i+=1
 
-            for line in process.stdout:
-                if line.strip() == "":
-                    continue
-                print(line)
-                try:
-                    resp = json.loads(line)
-                except Exception as e:
-                    print(e)
-                
-            process.wait()
+            else:
+                guess_string(wfuzz_cmd)
+            
         else:
             os.system(wfuzz_cmd)
