@@ -21,20 +21,25 @@ def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[D
     """
     Identify deviations from the majority response pattern to find probable characters.
     Returns dict with 'safe_chars' and 'special_chars'.
+    If no deviations are found, but only one safe_char appears in error responses, assume it's the probable character.
     """
     pattern_counts = Counter((e['chars'], e['words'], e['lines']) for e in data)
     if not pattern_counts:
         return {'safe_chars': [], 'special_chars': []}
+
     majority_pattern, _ = pattern_counts.most_common(1)[0]
     deviations = []
+
     for e in data:
         if e.get('code', 0) < 400:
             patt = (e['chars'], e['words'], e['lines'])
             if patt != majority_pattern:
                 dev = sum(abs(a - b) for a, b in zip(patt, majority_pattern))
                 deviations.append((dev, e))
+
     deviations.sort(key=lambda x: x[0], reverse=True)
     result = {'safe_chars': [], 'special_chars': []}
+
     if deviations:
         max_dev = deviations[0][0]
         for dev, e in deviations:
@@ -44,7 +49,20 @@ def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[D
             details = {'chars': e['chars'], 'words': e['words'], 'lines': e['lines'], 'deviation': dev}
             key = 'safe_chars' if len(char) == 1 and char in SAFE_CHARS else 'special_chars'
             result[key].append({'char': char, 'details': details})
+
+    # Fallback: If no deviations matched, check for single unique safe_char among errors
+    if not result['safe_chars'] and not result['special_chars']:
+        error_safe_chars = {
+            e.get('payload', ''): e for e in data
+            if e.get('code', 0) >= 400 and len(e.get('payload', '')) == 1 and e.get('payload') in SAFE_CHARS
+        }
+        if len(error_safe_chars) == 1:
+            char, e = next(iter(error_safe_chars.items()))
+            details = {'chars': e['chars'], 'words': e['words'], 'lines': e['lines'], 'deviation': None}
+            result['safe_chars'].append({'char': char, 'details': details})
+
     return result
+
 
 
 def to_ansi_c_quoted_string(s: str) -> str:
@@ -143,14 +161,18 @@ def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: s
     return ' '.join(parts)
 
 
-def guess_string(wfuzz_cmd: str) -> str:
+def guess_string(wfuzz_cmd: str, guess_append: bool) -> str:
     """Guess a single string by iteratively finding one char at a time."""
     result = ''
     while True:
-        cmd = wfuzz_cmd.replace('FUZZ', f'{result}FUZZ')
-        if 'FIZZW' in cmd:
-            cmd = cmd.replace('FIZZW', f'{len(result)}')
-
+        if guess_append:
+            cmd = wfuzz_cmd.replace('FUZZ', f'{result}FUZZ')
+        else:
+            cmd = wfuzz_cmd.replace('FUZZ', f'FUZZ')
+        if 'FIZZW0' in cmd:
+            cmd = cmd.replace('FIZZW0', f'{len(result)}')
+        elif 'FIZZW1' in cmd:
+            cmd = cmd.replace('FIZZW1', f'{len(result) + 1}')
         print(f"\n🔥 Executing: \n{cmd}\n")
         p = subprocess.Popen(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in p.stdout or []:
@@ -191,6 +213,8 @@ def main() -> None:
     run_parser.add_argument("--https", action="store_true")
 
     run_parser.add_argument("--guess-word", action="store_true")
+    run_parser.add_argument("--guess-append", action="store_true")
+
     run_parser.add_argument("--dr", action="store_true", help="Dry run: only print command")
     run_parser.add_argument("-v", action="store_true", help="Dry run: only print command")
 
@@ -221,7 +245,7 @@ def main() -> None:
                 i = 0
                 while True:
                     cur_cmd = cmd.replace('FIZZR', str(i))
-                    res = guess_string(cur_cmd)
+                    res = guess_string(cur_cmd, args.guess_append)
                     if not res:
                         print('\nGuessed results:')
                         for idx, r in enumerate(results): print(f"{idx}: {r}")
@@ -229,10 +253,10 @@ def main() -> None:
                     results.append(res)
                     i += 1
             elif 'FIZZW' in cmd:
-                res = guess_string(cmd)
+                res = guess_string(cmd, args.guess_append)
                 print(f"Guessed string: {res}")
             else:
-                res = guess_string(cmd)
+                res = guess_string(cmd, args.guess_append)
                 print(f"Guessed string: {res}")
         else:
             subprocess.run(cmd, shell=True, executable='/bin/bash')     
