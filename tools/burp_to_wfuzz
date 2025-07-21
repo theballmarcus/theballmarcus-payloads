@@ -11,11 +11,14 @@ import os
 import string
 import subprocess
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
+from unittest import result
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import statistics
 
 # Safe characters for guessing
 SAFE_CHARS = set(string.ascii_letters + string.digits + '-_')
-
 
 def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """
@@ -63,7 +66,73 @@ def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[D
 
     return result
 
+def find_most_probable_time_based_character(
+    data: List[Dict[str, Any]],
+    deviation_threshold: float = 0.35  # 35% by default
+) -> Union[Dict[str, Any], bool]:
+    """
+    Identify the character with the largest positive deviation in response time from the mean.
+    Return False if no character deviates enough (based on deviation_threshold).
+    
+    Parameters:
+        - data: list of request/response records
+        - deviation_threshold: minimum percent deviation from mean to be considered significant
 
+    Returns:
+        - dict with 'most_probable', 'deviation', and 'all_char_stats', or
+        - False if no character significantly deviates
+    """
+    if not data:
+        return False
+
+    # Group by payloads
+    payload_groups = {}
+    for e in data:
+        payload = e.get('payload', '')
+        if len(payload) != 1:
+            continue  # Skip multi-char payloads
+        payload_groups.setdefault(payload, []).append(e)
+
+    char_stats = []
+    
+    for payload, group in payload_groups.items():
+        avg_response_time = sum(e['response_time'] for e in group) / len(group)
+        stats = {
+            'char': payload,
+            'response_time': avg_response_time,
+            'count': len(group),
+            'details': {
+                'chars': sum(e['chars'] for e in group),
+                'words': sum(e['words'] for e in group),
+                'lines': sum(e['lines'] for e in group),
+            }
+        }
+        char_stats.append(stats)
+
+    if not char_stats:
+        return False
+
+    # Compute global average
+    global_mean = statistics.mean(c['response_time'] for c in char_stats)
+
+    # Add deviation to each
+    for c in char_stats:
+        c['deviation'] = c['response_time'] - global_mean
+        c['relative_deviation'] = c['deviation'] / global_mean if global_mean else 0
+
+    # Get the max deviation entry
+    most_probable = max(char_stats, key=lambda x: x['deviation'])
+    print(f"Most probable character: {most_probable['char']} with deviation {most_probable['deviation']} and relative deviation {most_probable['relative_deviation']:.2%}")
+    # Check if the deviation is significant enough
+    if most_probable['relative_deviation'] < deviation_threshold:
+        return False
+
+    return {
+        'most_probable': most_probable['char'],
+        'deviation': most_probable['deviation'],
+        'relative_deviation': most_probable['relative_deviation'],
+        'all_char_stats': char_stats
+    }
 
 def to_ansi_c_quoted_string(s: str) -> str:
     """Convert string to ANSI C quoted string for shell."""
@@ -82,7 +151,6 @@ def to_ansi_c_quoted_string(s: str) -> str:
             else: parts.append(f"\\x{ord(c):02x}")
         i += 1
     return "$'" + ''.join(parts) + "'"
-
 
 def parse_burp_request_file(path: str) -> Tuple[str, str, Dict[str, str], str]:
     """Parse Burp HTTP request file into method, path, headers, body."""
@@ -106,27 +174,30 @@ def parse_burp_request_file(path: str) -> Tuple[str, str, Dict[str, str], str]:
     body = '\r\n'.join(body_lines)
     return method, req_path, headers, body, base_url
 
-
-def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> str:
-    """Construct wfuzz command from parsed request and CLI args."""
-    # Wordlist
+def build_wordlist(args: argparse.Namespace) -> str:
+    """Build wordlist argument for wfuzz based on CLI args."""
     if args.w:
-        wl = f'file,{args.w}'
+        return f'file', f'{args.w}'
     elif args.r:
-        wl = f'range,1-{args.r}'
+        return f'range', f'1-{args.r}'
     elif args.guess_word:
         tmp = '/tmp/printables.txt'
         with open(tmp, 'w') as f:
             f.write('\n'.join(c for c in string.printable if c.isprintable()))
-        wl = f'file,{tmp}'
+        return f'file', f'{tmp}'
     else:
-        wl = ''
-
+        raise ValueError("No wordlist specified. Use -w, -r or --guess-word.")
+    
+def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> str:
+    """Construct wfuzz command from parsed request and CLI args."""
+    # Wordlist
+    type, wl = build_wordlist(args)
+    
     # Count FUZZ occurrences
     cnt = path.count('FUZZ') + sum(v.count('FUZZ') for v in headers.values()) + (body.count('FUZZ') if body else 0)
     if cnt == 0:
         raise ValueError("No FUZZ placeholder found in request.")
-    payloads = ' '.join(['-z ' + wl] * cnt)
+    payloads = ' '.join(['-z ' + f'{type},{wl}'] * cnt)
 
     # Base command
     parts = ['wfuzz', payloads, '-X', method]
@@ -160,8 +231,99 @@ def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: s
 
     return ' '.join(parts)
 
+def build_custom_parameters(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> Dict[str, Any]:
+    """Build custom parameters for python."""
+    _, wl = build_wordlist(args)
+    params = {
+        'method': method,
+        'headers': headers,
+        'body': body,
+        'base_url': args.base_url,
+        'wordlist': wl,
+        'path': path,
+    }
+    return params
 
-def guess_string(wfuzz_cmd: str, guess_append: bool) -> str:
+def guess_time_based(parameters: Dict[str, Any]) -> str:
+    """Build parameters for time-based guessing."""
+    guessed_string = ""
+
+    wordlist = open(parameters['wordlist'], 'r').read().splitlines()
+    method = parameters['method']
+    headers = parameters['headers']
+    body = parameters['body']
+    base_url = parameters['base_url']
+    req_url = f"{base_url}{parameters['path']}"
+
+    while True:
+        print(f"\n🔥 Guessing next character with current string: '{guessed_string}'")
+        results = []
+
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(async_send_request, req_url, method, headers, body, word, len(guessed_string)): word for word in wordlist}
+            for future in as_completed(futures):
+                word = futures[future]
+                try:
+                    response = future.result()
+                    if response:
+                        results.extend(response)
+                except Exception as e:
+                    print(f"Error processing word '{word}': {e}")
+
+        if not results:
+            return "No results found."
+        chars = find_most_probable_time_based_character(results)
+        if chars != False:
+            guessed_string += chars['most_probable']
+            print(f"Guessed character: '{chars['most_probable']}' -> Current string: '{guessed_string}'")
+        else:
+            print("No significant deviation found. Stopping guessing.")
+            print("Final guessed string:", guessed_string)
+            break
+
+def async_send_request(req_url: str, method: str, headers: Dict[str, str], body: str, payload: str, fizz_index: int) -> List[Dict[str, Any]]:
+    """Send an HTTP request asynchronously and return the response."""
+    cnt = sum(v.count('FUZZ') for v in headers.values())
+    cnt += body.count('FUZZ') if body else 0
+    cnt += req_url.count('FUZZ')
+    if cnt != 1:
+        raise ValueError("Only one FUZZ placeholder is allowed in the request.")
+
+    placeholders = {
+        'FIZZW0': str(fizz_index),
+        'FIZZW1': str(fizz_index + 1),
+        'FUZZ' : payload,
+    }
+
+    for placeholder, replacement in placeholders.items():
+        if (
+            placeholder in req_url or
+            placeholder in body or
+            any(placeholder in v for v in headers.values())
+        ):
+            req_url = req_url.replace(placeholder, replacement)
+            body = body.replace(placeholder, replacement)
+            headers = {k: v.replace(placeholder, replacement) for k, v in headers.items()}
+
+    headers = {k: v.replace('FUZZ', payload) for k, v in headers.items()}
+    body = body.replace('FUZZ', payload)
+    req_url = req_url.replace('FUZZ', payload)
+
+    try:
+        response = requests.request(method, req_url, headers=headers, data=body, timeout=10)
+        return [{
+            'code': response.status_code,
+            'chars': len(response.text),
+            'words': len(response.text.split()),
+            'lines': len(response.text.splitlines()),
+            'payload': payload,
+            'response_time': response.elapsed.total_seconds()
+        }]
+    except requests.RequestException as e:
+        print(f"Request failed: {e}")
+        return [{'code': 500, 'chars': 0, 'words': 0, 'lines': 0, 'payload': ''}]
+
+def guess_string_burp(wfuzz_cmd: str, guess_append: bool) -> str:
     """Guess a single string by iteratively finding one char at a time."""
     result = ''
     while True:
@@ -193,7 +355,6 @@ def guess_string(wfuzz_cmd: str, guess_append: bool) -> str:
         p.wait()
     return result
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert Burp request to wfuzz command.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -210,10 +371,12 @@ def main() -> None:
     run_parser.add_argument("--hc")
     run_parser.add_argument("--ss")
     run_parser.add_argument("--hs")
+
     run_parser.add_argument("--https", action="store_true")
 
     run_parser.add_argument("--guess-word", action="store_true")
     run_parser.add_argument("--guess-append", action="store_true")
+    run_parser.add_argument("--time-based", action="store_true", help="Use time-based payloads")
 
     run_parser.add_argument("--dr", action="store_true", help="Dry run: only print command")
     run_parser.add_argument("-v", action="store_true", help="Dry run: only print command")
@@ -231,6 +394,14 @@ def main() -> None:
                 else:
                     args.base_url = f"http://{base_url}"
 
+        if args.time_based:
+            # Here I will have to implement my own threading request handler since wfuzz does not support time-based payloads.
+            print('Working on time-based payloads...')
+            params = build_custom_parameters(method, path, headers, body, args)
+            guess_time_based(params)
+            return
+            exit(0)
+
         cmd = build_wfuzz_command(method, path, headers, body, args)
 
         print(f"\n🔥 Generated wfuzz command:\n{cmd}\n")
@@ -245,7 +416,7 @@ def main() -> None:
                 i = 0
                 while True:
                     cur_cmd = cmd.replace('FIZZR', str(i))
-                    res = guess_string(cur_cmd, args.guess_append)
+                    res = guess_string_burp(cur_cmd, args.guess_append)
                     if not res:
                         print('\nGuessed results:')
                         for idx, r in enumerate(results): print(f"{idx}: {r}")
@@ -253,10 +424,10 @@ def main() -> None:
                     results.append(res)
                     i += 1
             elif 'FIZZW' in cmd:
-                res = guess_string(cmd, args.guess_append)
+                res = guess_string_burp(cmd, args.guess_append)
                 print(f"Guessed string: {res}")
             else:
-                res = guess_string(cmd, args.guess_append)
+                res = guess_string_burp(cmd, args.guess_append)
                 print(f"Guessed string: {res}")
         else:
             subprocess.run(cmd, shell=True, executable='/bin/bash')     
