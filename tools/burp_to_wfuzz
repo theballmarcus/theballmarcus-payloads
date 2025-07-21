@@ -68,7 +68,7 @@ def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[D
 
 def find_most_probable_time_based_character(
     data: List[Dict[str, Any]],
-    deviation_threshold: float = 0.35  # 35% by default
+    deviation_threshold: float = 1  # 35% by default
 ) -> Union[Dict[str, Any], bool]:
     """
     Identify the character with the largest positive deviation in response time from the mean.
