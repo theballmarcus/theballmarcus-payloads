@@ -403,7 +403,6 @@ def parse_mode_options(raw_options: str) -> Dict[str, Any]:
     Returns a dictionary of options.
     """
     options = {}
-    print(raw_options)
     for opt in raw_options.split(','):
         if '=' in opt:
             key, value = opt.split('=', 1)
@@ -693,7 +692,7 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                         candidate = gen.current_string + ch
                     else:
                         candidate = ch
-                        
+
                     repl = {x: token_generators[x].get_payload() for x in non_stateful}
                     repl[t] = candidate
 
@@ -823,9 +822,7 @@ def send_request(
         if script_modules:
             for script_module in script_modules:
                 execute_dynamic_script(script_module, summary)
-        if payload == 'i':
-            print(body)
-            print(response.text)
+
         return [summary]
     
     except requests.RequestException as e:
