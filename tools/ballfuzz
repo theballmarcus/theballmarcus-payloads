@@ -253,6 +253,7 @@ def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
             options.setdefault("step", "1")
             options.setdefault("end", "100")  # Default end value
             options.setdefault("follow", False)
+            options.setdefault("padding", 0)
 
         elif mode == "G":  # Character guessing (ZG:set=...)
             options = parse_mode_options(options_raw)
@@ -324,6 +325,7 @@ class TokenGenerator:
             self.step = int(self.options.get('step', 1))
             self.current_value = self.start
             self.follow = self.options.get('follow', False)
+            self.padding = int(self.options.get('padding', 0))
             
         elif self.mode == 'W':
             self.wordlist = self.options['wordlist']
@@ -356,12 +358,12 @@ class TokenGenerator:
         """Generate the next payload based on token mode"""
         if self.mode == 'I':
             if self.follow:
-                return str(self.guessed_length)
+                return str(self.guessed_length).rjust(self.padding, '0')
             else:
                 payload = str(self.current_value)
                 if self.current_value <= self.end:
                     self.current_value += self.step
-                return payload
+                return payload.rjust(self.padding, '0')
                 
         elif self.mode == 'W':
             if self.wordlist_index < len(self.words):
@@ -405,15 +407,16 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    method        = parameters['method']
-    headers       = parameters['headers']
-    body          = parameters['body']
-    base_url      = parameters['base_url']
-    path          = parameters['path']
-    req_url       = f"{base_url}{path}"
-    filters       = parameters.get('response_filters', {}) or {}
-    fuzz_tokens   = parameters.get('FUZZ', [])
-    script_modules= parameters.get('script_modules', [])
+    method          = parameters['method']
+    headers         = parameters['headers']
+    body            = parameters['body']
+    base_url        = parameters['base_url']
+    path            = parameters['path']
+    req_url         = f"{base_url}{path}"
+    filters         = parameters.get('response_filters', {}) or {}
+    fuzz_tokens     = parameters.get('FUZZ', [])
+    script_modules  = parameters.get('script_modules', [])
+    no_postprocess  = parameters.get('no_postprocess', False)
 
     # Initialize generators for each FUZZ token
     token_generators = {}
@@ -453,26 +456,40 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                 for tok, val in repl.items():
                     new_b = new_b.replace(tok, val)
 
-                # submit request
-                fut = executor.submit(
-                    send_request,
-                    req_url, method, new_h, new_b,
-                    filters,
-                    payload=str(repl),
-                    script_modules=script_modules
-                )
-                nonstateful_futures[fut] = repl
+                if no_postprocess:
+                    # Wait for response immediately and discard
+                    _ = send_request(
+                        req_url, method, new_h, new_b,
+                        filters,
+                        payload=str(repl),
+                        script_modules=script_modules,
+                        no_postprocess=True
+                    )
+                    # No storing of repl or response
+                else:
+                    fut = executor.submit(
+                        send_request,
+                        req_url, method, new_h, new_b,
+                        filters,
+                        payload=str(repl),
+                        script_modules=script_modules,
+                        no_postprocess=False
+                    )
+                    nonstateful_futures[fut] = repl
 
             # collect all non-stateful responses
-            for fut in as_completed(nonstateful_futures):
-                repl = nonstateful_futures[fut]
-                resp = fut.result()[0]
-                all_nonstateful_resps.append((repl, resp))
-                results.append(resp)
-                # if any filter is active and this resp passes, exit immediately
-                if any(v is not None for v in filters.values()) and resp.get('show_response'):
-                    if VERBOSE:
-                        print(f"\n🔑 Found matching non-stateful payload: {repl}")
+            if not no_postprocess:
+                for fut in as_completed(nonstateful_futures):
+                    repl = nonstateful_futures[fut]
+                    resp = fut.result()[0]
+                    all_nonstateful_resps.append((repl, resp))
+                    results.append(resp)
+                    # if any filter is active and this resp passes, exit immediately
+                    if any(v is not None for v in filters.values()) and resp.get('show_response'):
+                        if VERBOSE:
+                            print(f"\n🔑 Found matching non-stateful payload: {repl}")
+            else: 
+                return []  # no post-processing, return collected results
 
         # Otherwise, or after exhausting non-stateful, handle stateful character guessing
         while stateful:
@@ -582,8 +599,9 @@ def send_request(
     idx: int = 0,
     payload: str = "",
     script_modules: Optional[List[Any]] = None,
-    print_response: bool = False
-) -> Tuple[bool, Dict[str, Any]]:
+    print_response: bool = False,
+    no_postprocess: bool = False
+) -> Optional[Tuple[bool, Dict[str, Any]]]:
     global VERBOSE
     """Send a request and return filter status + summary."""
     try:
@@ -631,19 +649,26 @@ def send_request(
             for script_module in script_modules:
                 execute_dynamic_script(script_module, summary)
 
-        return [summary]
+        if no_postprocess:
+            if show_response:
+                print(f"🔍 Response for payload passed filters {payload}: {summary}")
+        else:
+            return [summary]
     
     except requests.RequestException as e:
         print(f"Request failed: {e}")
-        return [{
-            'code': 500, 
-            'chars': 0, 
-            'words': 0, 
-            'lines': 0, 
-            'response_time': 0,
-            'payload': body,
-            'show_response': False
-        }]
+        if no_postprocess:
+            return
+        else:
+            return [{
+                'code': 500, 
+                'chars': 0, 
+                'words': 0, 
+                'lines': 0, 
+                'response_time': 0,
+                'payload': body,
+                'show_response': False
+            }]
     
 def main() -> None:
     global VERBOSE
@@ -670,6 +695,7 @@ def main() -> None:
         
     run_parser.add_argument("--time-based", action="store_true", help="Enable time-based guessing")
     run_parser.add_argument("--time-based-deviation", type=float, default=0.35, help="Deviation threshold for time-based guessing (default: 0.35)")
+    run_parser.add_argument("--no-postprocess", "--npp", action="store_true") # HTTP per default unless specified
 
     run_parser.add_argument("--max-workers", type=int, default=MAX_WORKERS, help="Maximum number of concurrent workers (default: 10)")
 
@@ -706,6 +732,11 @@ def main() -> None:
             path = '/' + path
 
         params = build_custom_parameters(method, path, headers, body, args)
+
+        if args.no_postprocess:
+            params['no_postprocess'] = True
+            if VERBOSE:
+                print("No post-processing enabled: responses will not be stored or analyzed.")
 
         if VERBOSE and not args.test_single:
             print(f"Parsed parameters: {json.dumps(params, indent=2)}")
