@@ -29,239 +29,38 @@ DEFAULT_WORDLISTS = {
 }
 SAFE_CHARS = set(string.ascii_letters + string.digits + '-_')
 
-## ----- Response Analysis ----- ##
+## ----- Response Analysis ----- ### 
 
-def find_most_probable_character(data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Identify deviations from the majority response pattern to find probable characters.
-    Returns dict with 'safe_chars' and 'special_chars'.
-    If no deviations are found, but only one safe_char appears in error responses, assume it's the probable character.
-    """
-    pattern_counts = Counter((e['chars'], e['words'], e['lines']) for e in data)
-    if not pattern_counts:
-        return {'safe_chars': [], 'special_chars': []}
-
-    majority_pattern, _ = pattern_counts.most_common(1)[0]
-    deviations = []
-
-    for e in data:
-        if e.get('code', 0) < 400:
-            patt = (e['chars'], e['words'], e['lines'])
-            if patt != majority_pattern:
-                dev = sum(abs(a - b) for a, b in zip(patt, majority_pattern))
-                deviations.append((dev, e))
-
-    deviations.sort(key=lambda x: x[0], reverse=True)
-    result = {'safe_chars': [], 'special_chars': []}
-
-    if deviations:
-        max_dev = deviations[0][0]
-        for dev, e in deviations:
-            if dev != max_dev:
-                break
-            char = e.get('payload', '')
-            details = {'chars': e['chars'], 'words': e['words'], 'lines': e['lines'], 'deviation': dev}
-            key = 'safe_chars' if len(char) == 1 and char in SAFE_CHARS else 'special_chars'
-            result[key].append({'char': char, 'details': details})
-
-    # Fallback: If no deviations matched, check for single unique safe_char among errors
-    if not result['safe_chars'] and not result['special_chars']:
-        error_safe_chars = {
-            e.get('payload', ''): e for e in data
-            if e.get('code', 0) >= 400 and len(e.get('payload', '')) == 1 and e.get('payload') in SAFE_CHARS
-        }
-        if len(error_safe_chars) == 1:
-            char, e = next(iter(error_safe_chars.items()))
-            details = {'chars': e['chars'], 'words': e['words'], 'lines': e['lines'], 'deviation': None}
-            result['safe_chars'].append({'char': char, 'details': details})
-
-    return result
-
-def find_most_probable_time_based_character(
-    data: List[Dict[str, Any]],
-    deviation_threshold: float = 1  # 35% by default
-) -> Union[Dict[str, Any], bool]:
-    """
-    Identify the character with the largest positive deviation in response time from the mean.
-    Return False if no character deviates enough (based on deviation_threshold).
-    
-    Parameters:
-        - data: list of request/response records
-        - deviation_threshold: minimum percent deviation from mean to be considered significant
-
-    Returns:
-        - dict with 'most_probable', 'deviation', and 'all_char_stats', or
-        - False if no character significantly deviates
-    """
-    if not data:
-        return False
-
-    # Group by payloads
-    payload_groups = {}
-    for e in data:
-        payload = e.get('payload', '')
-        if len(payload) != 1:
-            continue  # Skip multi-char payloads
-        payload_groups.setdefault(payload, []).append(e)
-
-    char_stats = []
-    
-    for payload, group in payload_groups.items():
-        avg_response_time = sum(e['response_time'] for e in group) / len(group)
-        stats = {
-            'char': payload,
-            'response_time': avg_response_time,
-            'count': len(group),
-            'details': {
-                'chars': sum(e['chars'] for e in group),
-                'words': sum(e['words'] for e in group),
-                'lines': sum(e['lines'] for e in group),
-            }
-        }
-        char_stats.append(stats)
-
-    if not char_stats:
-        return False
-
-    # Compute global average
-    global_mean = statistics.mean(c['response_time'] for c in char_stats)
-
-    # Add deviation to each
-    for c in char_stats:
-        c['deviation'] = c['response_time'] - global_mean
-        c['relative_deviation'] = c['deviation'] / global_mean if global_mean else 0
-
-    # Get the max deviation entry
-    most_probable = max(char_stats, key=lambda x: x['deviation'])
-    print(f"Most probable character: {most_probable['char']} with deviation {most_probable['deviation']} and relative deviation {most_probable['relative_deviation']:.2%}")
-    # Check if the deviation is significant enough
-    if most_probable['relative_deviation'] < deviation_threshold:
-        return False
-
-    return {
-        'most_probable': most_probable['char'],
-        'deviation': most_probable['deviation'],
-        'relative_deviation': most_probable['relative_deviation'],
-        'all_char_stats': char_stats
-    }
-
-# def analyze_responses(responses: List[Dict[str, Any]], time_based: bool) -> Optional[str]:
-#     """
-#     Analyze responses to find the most probable character.
-#     Uses different strategies based on attack type.
-#     """
-#     if not responses:
-#         return None
-    
-#     if time_based:
-#         # Group by payload characters
-#         char_groups = {}
-#         for r in responses:
-#             char = r.get('candidate_char', '')
-#             if char:
-#                 char_groups.setdefault(char, []).append(r)
-        
-#         # Calculate average response times
-#         char_stats = []
-#         for char, group in char_groups.items():
-#             avg_time = sum(r['response_time'] for r in group) / len(group)
-#             char_stats.append({'char': char, 'avg_time': avg_time})
-        
-#         if not char_stats:
-#             return None
-        
-#         # Find global average
-#         global_avg = statistics.mean(s['avg_time'] for s in char_stats)
-        
-#         # Find character with max deviation
-#         max_deviation = 0
-#         probable_char = None
-#         for stat in char_stats:
-#             deviation = stat['avg_time'] - global_avg
-#             if deviation > max_deviation:
-#                 max_deviation = deviation
-#                 probable_char = stat['char']
-                
-#         # Check if deviation is significant (35% threshold)
-#         if max_deviation > global_avg * 0.35:
-#             return probable_char
-#         return None
-    
-#     else:
-#         # Non-time-based analysis
-#         pattern_counts = Counter(
-#             (e['chars'], e['words'], e['lines']) for e in responses
-#         )
-#         if not pattern_counts:
-#             return None
-
-#         majority_pattern, _ = pattern_counts.most_common(1)[0]
-#         deviations = []
-
-#         for e in responses:
-#             if e.get('code', 0) < 400:
-#                 pattern = (e['chars'], e['words'], e['lines'])
-#                 if pattern != majority_pattern:
-#                     dev = sum(abs(a - b) for a, b in zip(pattern, majority_pattern))
-#                     deviations.append((dev, e))
-
-#         if not deviations:
-#             # Fallback: look for single safe char in error responses
-#             error_chars = {
-#                 e.get('candidate_char', ''): e for e in responses
-#                 if e.get('code', 0) >= 400 and 
-#                 e.get('candidate_char', '') in SAFE_CHARS
-#             }
-#             if len(error_chars) == 1:
-#                 return next(iter(error_chars.keys()))
-#             return None
-
-#         # Find max deviation
-#         max_dev = max(dev for dev, _ in deviations)
-        
-#         # Get all chars with max deviation
-#         probable_chars = set()
-#         for dev, e in deviations:
-#             if dev == max_dev:
-#                 char = e.get('candidate_char', '')
-#                 if char in SAFE_CHARS:
-#                     probable_chars.add(char)
-        
-#         return next(iter(probable_chars)) if probable_chars else None
-
-def find_successful_wordlist_payload(responses):
+def find_successful_wordlist_payload(responses, deviation_threshold=1):
+    global VERBOSE
     """
     Identify the payload (e.g., password) that succeeded in a wordlist attack.
     Criteria (in order):
     1. HTTP status code in 200-299 (success)
     2. show_response True (passed filters, e.g. show_string)
-    3. Longest deviation from majority response length
+    3. Longest deviation from majority response length,
+       only if deviation is significant (greater than deviation_threshold)
+    
     Returns the payload string or None if not found.
     """
     if not responses:
         return None
 
-    # 1. Check for HTTP success codes
-    for r in responses:
-        if 200 <= r.get('code', 0) < 300:
-            return r.get('payload')
-
-    # 2. Check for show_response
-    for r in responses:
-        if r.get('show_response'):
-            return r.get('payload')
-
-    # 3. Fallback: length deviation from majority
     lengths = [r.get('chars', 0) for r in responses]
     if not lengths:
         return None
 
-    # majority pattern: most common length
     most_common_len, _ = Counter(lengths).most_common(1)[0]
-    deviations = [ (abs(r['chars'] - most_common_len), r) for r in responses ]
+    deviations = [(abs(r['chars'] - most_common_len), r) for r in responses]
     deviations.sort(reverse=True, key=lambda x: x[0])
-    # return payload with max deviation
-    return deviations[0][1].get('payload')
+
+    max_deviation, best_response = deviations[0]
+    if VERBOSE:
+        print(f"Max deviation: {max_deviation}, Threshold: {deviation_threshold}")
+    if max_deviation > deviation_threshold:
+        return best_response.get('payload')
+
+    return None
 
 def analyze_responses(responses, time_based=False):
     """
@@ -672,8 +471,8 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                 results.append(resp)
                 # if any filter is active and this resp passes, exit immediately
                 if any(v is not None for v in filters.values()) and resp.get('show_response'):
-                    print(f"\n🔑 Found matching non-stateful payload: {repl}")
-                    return [resp]
+                    if VERBOSE:
+                        print(f"\n🔑 Found matching non-stateful payload: {repl}")
 
         # Otherwise, or after exhausting non-stateful, handle stateful character guessing
         while stateful:
@@ -747,14 +546,23 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
             if not progress:
                 break  # no further progress
 
-    # Post‐processing for pure non‐stateful when no filters were provided
-    if not stateful and all(v is None for v in filters.values()) and all_nonstateful_resps:
+    # Post‐processing for pure non‐stateful when no filters were provided all(v is None for v in filters.values()) and 
+    if not stateful and all_nonstateful_resps:
+        # check for filters
+        if any(v is not None for v in filters.values()):
+            matches = [resp for _, resp in all_nonstateful_resps if resp.get('show_response')]
+            if VERBOSE:
+                print(f"Found {len(matches)} matching non-stateful payloads with filters applied.")
+            if matches and len(matches) == 1:
+                print(f"\n🔑 Found only one matching non-stateful payload: {matches[0].get('payload')}")
+                return matches
+
         # Extract just the response dicts
         flat_resps = [resp for _, resp in all_nonstateful_resps]
 
         # Delegate to our unified analyzer (will pick the 2xx or best‑length payload)
-        successful = find_successful_wordlist_payload(flat_resps, time_based=False)
-
+        successful = find_successful_wordlist_payload(flat_resps)
+        
         if successful:
             # Find and return only the matching response(s)
             matched = [r for r in flat_resps if r.get('payload') == successful]
