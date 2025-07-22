@@ -174,30 +174,48 @@ def parse_burp_request_file(path: str) -> Tuple[str, str, Dict[str, str], str]:
     body = '\r\n'.join(body_lines)
     return method, req_path, headers, body, base_url
 
-def build_wordlist(args: argparse.Namespace) -> str:
+def build_wordlist(args: argparse.Namespace) -> List[str]:
     """Build wordlist argument for wfuzz based on CLI args."""
+    wordslists = []
     if args.w:
-        return f'file', f'{args.w}'
-    elif args.r:
-        return f'range', f'1-{args.r}'
-    elif args.guess_word:
+        for wl in args.w:
+            if not os.path.isfile(wl):
+                raise ValueError(f"Wordlist file '{wl}' does not exist.")
+            if not os.access(wl, os.R_OK):
+                raise ValueError(f"Wordlist file '{wl}' is not readable.")
+            wordslists.append([f'file', wl])
+    if args.r:
+        for r in args.r:
+            if r <= 0:
+                raise ValueError(f"Invalid range value: {r}. Must be a positive integer.")
+            if r > 1000000:
+                raise ValueError(f"Range value {r} is too large. Maximum is 1,000,000.")
+            wordslists.append([f'range', f'1-{r}'])  # Use range format for wfuzz
+    if args.guess_word:
         tmp = '/tmp/printables.txt'
         with open(tmp, 'w') as f:
             f.write('\n'.join(c for c in string.printable if c.isprintable()))
-        return f'file', f'{tmp}'
-    else:
-        raise ValueError("No wordlist specified. Use -w, -r or --guess-word.")
-    
+        return [[f'file', f'{tmp}']] # Only support one wordlist for guessing
+
+    if not wordslists:
+        raise ValueError("No valid wordlist provided. Use -w, -r or --guess-word.")
+    return wordslists
+
 def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> str:
     """Construct wfuzz command from parsed request and CLI args."""
     # Wordlist
-    type, wl = build_wordlist(args)
-    
+    wls = build_wordlist(args)
+    print(wls)
+    print(f"Using wordlists: {', '.join(f'{type},{wl}' for type, wl in wls)}")
     # Count FUZZ occurrences
     cnt = path.count('FUZZ') + sum(v.count('FUZZ') for v in headers.values()) + (body.count('FUZZ') if body else 0)
     if cnt == 0:
         raise ValueError("No FUZZ placeholder found in request.")
-    payloads = ' '.join(['-z ' + f'{type},{wl}'] * cnt)
+    
+    payloads = ""
+    for wl in wls:
+        print(wl)
+        payloads += ' '.join(['-z ' + f'{wl[0]},{wl[1]} '])
 
     # Base command
     parts = ['wfuzz', payloads, '-X', method]
@@ -233,7 +251,7 @@ def build_wfuzz_command(method: str, path: str, headers: Dict[str, str], body: s
 
 def build_custom_parameters(method: str, path: str, headers: Dict[str, str], body: str, args: argparse.Namespace) -> Dict[str, Any]:
     """Build custom parameters for python."""
-    _, wl = build_wordlist(args)
+    _, wl = build_wordlist(args)[0]
     params = {
         'method': method,
         'headers': headers,
@@ -244,7 +262,7 @@ def build_custom_parameters(method: str, path: str, headers: Dict[str, str], bod
     }
     return params
 
-def guess_time_based(parameters: Dict[str, Any]) -> str:
+def guess_time_based(parameters: Dict[str, Any], deviation: float) -> str:
     """Build parameters for time-based guessing."""
     guessed_string = ""
 
@@ -260,7 +278,14 @@ def guess_time_based(parameters: Dict[str, Any]) -> str:
         results = []
 
         with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(async_send_request, req_url, method, headers, body, word, len(guessed_string)): word for word in wordlist}
+            futures = {}
+            if 'FIZZIR' in req_url or 'FIZZIR' in body or any('FIZZIR' in v for v in headers.values()):
+                futures = {
+                    executor.submit(async_send_request, req_url, method, headers, body, word, idx + 1): word
+                    for idx, word in enumerate(wordlist)
+                }
+            else:
+                futures = {executor.submit(async_send_request, req_url, method, headers, body, word, len(guessed_string)): word for word in wordlist}
             for future in as_completed(futures):
                 word = futures[future]
                 try:
@@ -272,7 +297,7 @@ def guess_time_based(parameters: Dict[str, Any]) -> str:
 
         if not results:
             return "No results found."
-        chars = find_most_probable_time_based_character(results)
+        chars = find_most_probable_time_based_character(results, deviation)
         if chars != False:
             guessed_string += chars['most_probable']
             print(f"Guessed character: '{chars['most_probable']}' -> Current string: '{guessed_string}'")
@@ -292,6 +317,7 @@ def async_send_request(req_url: str, method: str, headers: Dict[str, str], body:
     placeholders = {
         'FIZZW0': str(fizz_index),
         'FIZZW1': str(fizz_index + 1),
+        'FIZZIR': str(fizz_index),
         'FUZZ' : payload,
     }
 
@@ -311,6 +337,9 @@ def async_send_request(req_url: str, method: str, headers: Dict[str, str], body:
 
     try:
         response = requests.request(method, req_url, headers=headers, data=body, timeout=10)
+        
+        print(f"Request to {req_url} with payload '{payload}' returned status {response.status_code} in {response.elapsed.total_seconds()} seconds. L: {len(response.text)}")
+
         return [{
             'code': response.status_code,
             'chars': len(response.text),
@@ -363,8 +392,8 @@ def main() -> None:
     run_parser.add_argument("request_file")
 
     run_parser.add_argument("--base_url")
-    run_parser.add_argument("-w")
-    run_parser.add_argument("-r", type=int)
+    run_parser.add_argument("-w", action='append', help="Wordlist file(s)")
+    run_parser.add_argument("-r", action='append', type=int, help="Range for numeric guessing (e.g. 1-100)")
     run_parser.add_argument("--hl", type=int)
     run_parser.add_argument("--hh", type=int)
     run_parser.add_argument("--sc")
@@ -377,9 +406,10 @@ def main() -> None:
     run_parser.add_argument("--guess-word", action="store_true")
     run_parser.add_argument("--guess-append", action="store_true")
     run_parser.add_argument("--time-based", action="store_true", help="Use time-based payloads")
+    run_parser.add_argument("--time-based-deviation", type=float, default=0.35, help="Deviation threshold for time-based guessing (default: 0.35)")
 
     run_parser.add_argument("--dr", action="store_true", help="Dry run: only print command")
-    run_parser.add_argument("-v", action="store_true", help="Dry run: only print command")
+    run_parser.add_argument("-v", action="store_true", help="Verbose mode: print more details")
 
     args = parser.parse_args()
 
@@ -398,14 +428,14 @@ def main() -> None:
             # Here I will have to implement my own threading request handler since wfuzz does not support time-based payloads.
             print('Working on time-based payloads...')
             params = build_custom_parameters(method, path, headers, body, args)
-            guess_time_based(params)
+            guess_time_based(params, args.time_based_deviation)
             return
             exit(0)
 
         cmd = build_wfuzz_command(method, path, headers, body, args)
 
         print(f"\n🔥 Generated wfuzz command:\n{cmd}\n")
-        if args.dr or args.v:
+        if args.dr:
             print("Dry run mode: command not executed.")
             return
 
@@ -415,7 +445,7 @@ def main() -> None:
                 results = []
                 i = 0
                 while True:
-                    cur_cmd = cmd.replace('FIZZR', str(i))
+                    cur_cmd = cmd.replace('FIZZR', str(i))  
                     res = guess_string_burp(cur_cmd, args.guess_append)
                     if not res:
                         print('\nGuessed results:')
