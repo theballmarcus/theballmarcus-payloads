@@ -6,6 +6,7 @@ Converts a HTTP(S) request file into fuzzing requests.
 and optionally performs character-by-character fuzzing.
 """
 import argparse
+from ast import Str
 import json
 import os
 import string
@@ -396,6 +397,28 @@ def parse_response():
 
 ## ----- Setup ----- ##
 
+def parse_mode_options(raw_options: str) -> Dict[str, Any]:
+    """
+    Parse mode options from a string like 'set=alphanum,append=True'.
+    Returns a dictionary of options.
+    """
+    options = {}
+    print(raw_options)
+    for opt in raw_options.split(','):
+        if '=' in opt:
+            key, value = opt.split('=', 1)
+            value = value.strip()
+            if value.lower() == 'true':
+                options[key.strip()] = True
+            elif value.lower() == 'false':
+                options[key.strip()] = False
+            else:
+                options[key.strip()] = value.strip()
+        else:
+            options[opt.strip()] = True
+
+    return options
+
 def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
     # Regex pattern to find fuzz tokens
     fuzz_pattern = re.compile(
@@ -415,7 +438,6 @@ def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
         # Mode-specific option parsing
         if mode == "W":  # Wordlist mode
             # Match to default wordlist or custom wordlist
-
             options = {
                 "wordlist": options_raw.strip()
             }
@@ -426,13 +448,7 @@ def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
                     break
 
         elif mode == "I":  # Integer guessing
-            for opt in options_raw.split(","):
-                if "=" in opt:
-                    key, value = opt.split("=", 1)
-                    options[key.strip()] = value.strip()
-                else:
-                    options[opt.strip()] = True
-                
+            options = parse_mode_options(options_raw)
 
             # Defaults
             options.setdefault("start", "0")
@@ -441,12 +457,7 @@ def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
             options.setdefault("follow", False)
 
         elif mode == "G":  # Character guessing (ZG:set=...)
-            for opt in options_raw.split(","):
-                if "=" in opt:
-                    key, value = opt.split("=", 1)
-                    options[key.strip()] = value.strip()
-                else:
-                    options[opt.strip()] = True
+            options = parse_mode_options(options_raw)
             options.setdefault("set", "alphanum")
             options.setdefault("append", False)
 
@@ -501,7 +512,6 @@ class TokenGenerator:
         self.token = token_spec['token']
         self.mode = token_spec['mode']
         self.options = token_spec.get('options', {})
-        self.follow = token_spec.get('follow', False)
         
         # State tracking
         self.guessed_length = 0  # For follow=True tokens
@@ -515,6 +525,7 @@ class TokenGenerator:
             self.end = int(self.options.get('end', 100))
             self.step = int(self.options.get('step', 1))
             self.current_value = self.start
+            self.follow = self.options.get('follow', False)
             
         elif self.mode == 'W':
             self.wordlist = self.options['wordlist']
@@ -678,10 +689,11 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                 if len(gen.current_string) >= 50:
                     continue
                 for idx, ch in enumerate(gen.charset):
-                    if gen.options.get('append', False):
+                    if gen.options.get('append', False) == True:
                         candidate = gen.current_string + ch
                     else:
                         candidate = ch
+                        
                     repl = {x: token_generators[x].get_payload() for x in non_stateful}
                     repl[t] = candidate
 
@@ -811,7 +823,9 @@ def send_request(
         if script_modules:
             for script_module in script_modules:
                 execute_dynamic_script(script_module, summary)
-
+        if payload == 'i':
+            print(body)
+            print(response.text)
         return [summary]
     
     except requests.RequestException as e:
