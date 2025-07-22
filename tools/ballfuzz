@@ -144,89 +144,168 @@ def find_most_probable_time_based_character(
         'all_char_stats': char_stats
     }
 
-def analyze_responses(responses: List[Dict[str, Any]], time_based: bool) -> Optional[str]:
+# def analyze_responses(responses: List[Dict[str, Any]], time_based: bool) -> Optional[str]:
+#     """
+#     Analyze responses to find the most probable character.
+#     Uses different strategies based on attack type.
+#     """
+#     if not responses:
+#         return None
+    
+#     if time_based:
+#         # Group by payload characters
+#         char_groups = {}
+#         for r in responses:
+#             char = r.get('candidate_char', '')
+#             if char:
+#                 char_groups.setdefault(char, []).append(r)
+        
+#         # Calculate average response times
+#         char_stats = []
+#         for char, group in char_groups.items():
+#             avg_time = sum(r['response_time'] for r in group) / len(group)
+#             char_stats.append({'char': char, 'avg_time': avg_time})
+        
+#         if not char_stats:
+#             return None
+        
+#         # Find global average
+#         global_avg = statistics.mean(s['avg_time'] for s in char_stats)
+        
+#         # Find character with max deviation
+#         max_deviation = 0
+#         probable_char = None
+#         for stat in char_stats:
+#             deviation = stat['avg_time'] - global_avg
+#             if deviation > max_deviation:
+#                 max_deviation = deviation
+#                 probable_char = stat['char']
+                
+#         # Check if deviation is significant (35% threshold)
+#         if max_deviation > global_avg * 0.35:
+#             return probable_char
+#         return None
+    
+#     else:
+#         # Non-time-based analysis
+#         pattern_counts = Counter(
+#             (e['chars'], e['words'], e['lines']) for e in responses
+#         )
+#         if not pattern_counts:
+#             return None
+
+#         majority_pattern, _ = pattern_counts.most_common(1)[0]
+#         deviations = []
+
+#         for e in responses:
+#             if e.get('code', 0) < 400:
+#                 pattern = (e['chars'], e['words'], e['lines'])
+#                 if pattern != majority_pattern:
+#                     dev = sum(abs(a - b) for a, b in zip(pattern, majority_pattern))
+#                     deviations.append((dev, e))
+
+#         if not deviations:
+#             # Fallback: look for single safe char in error responses
+#             error_chars = {
+#                 e.get('candidate_char', ''): e for e in responses
+#                 if e.get('code', 0) >= 400 and 
+#                 e.get('candidate_char', '') in SAFE_CHARS
+#             }
+#             if len(error_chars) == 1:
+#                 return next(iter(error_chars.keys()))
+#             return None
+
+#         # Find max deviation
+#         max_dev = max(dev for dev, _ in deviations)
+        
+#         # Get all chars with max deviation
+#         probable_chars = set()
+#         for dev, e in deviations:
+#             if dev == max_dev:
+#                 char = e.get('candidate_char', '')
+#                 if char in SAFE_CHARS:
+#                     probable_chars.add(char)
+        
+#         return next(iter(probable_chars)) if probable_chars else None
+
+def find_successful_wordlist_payload(responses):
     """
-    Analyze responses to find the most probable character.
-    Uses different strategies based on attack type.
+    Identify the payload (e.g., password) that succeeded in a wordlist attack.
+    Criteria (in order):
+    1. HTTP status code in 200-299 (success)
+    2. show_response True (passed filters, e.g. show_string)
+    3. Longest deviation from majority response length
+    Returns the payload string or None if not found.
     """
     if not responses:
         return None
-    
-    if time_based:
-        # Group by payload characters
-        char_groups = {}
-        for r in responses:
-            char = r.get('candidate_char', '')
-            if char:
-                char_groups.setdefault(char, []).append(r)
-        
-        # Calculate average response times
-        char_stats = []
-        for char, group in char_groups.items():
-            avg_time = sum(r['response_time'] for r in group) / len(group)
-            char_stats.append({'char': char, 'avg_time': avg_time})
-        
-        if not char_stats:
-            return None
-        
-        # Find global average
-        global_avg = statistics.mean(s['avg_time'] for s in char_stats)
-        
-        # Find character with max deviation
-        max_deviation = 0
-        probable_char = None
-        for stat in char_stats:
-            deviation = stat['avg_time'] - global_avg
-            if deviation > max_deviation:
-                max_deviation = deviation
-                probable_char = stat['char']
-                
-        # Check if deviation is significant (35% threshold)
-        if max_deviation > global_avg * 0.35:
-            return probable_char
+
+    # 1. Check for HTTP success codes
+    for r in responses:
+        if 200 <= r.get('code', 0) < 300:
+            return r.get('payload')
+
+    # 2. Check for show_response
+    for r in responses:
+        if r.get('show_response'):
+            return r.get('payload')
+
+    # 3. Fallback: length deviation from majority
+    lengths = [r.get('chars', 0) for r in responses]
+    if not lengths:
         return None
-    
+
+    # majority pattern: most common length
+    most_common_len, _ = Counter(lengths).most_common(1)[0]
+    deviations = [ (abs(r['chars'] - most_common_len), r) for r in responses ]
+    deviations.sort(reverse=True, key=lambda x: x[0])
+    # return payload with max deviation
+    return deviations[0][1].get('payload')
+
+def analyze_responses(responses, time_based=False):
+    """
+    Unified analysis for fuzzing responses.
+    - If time_based: delegate to timing analysis
+    - If payloads are multi-char (wordlist), use dedicated finder
+    - Else fallback to char-based analysis
+    """
+    # Detect multi-char payloads: any payload length > 1
+    # multi = any(len(r.get('payload', '')) > 1 for r in responses)
+    # if multi and not time_based:
+    #     return find_successful_wordlist_payload(responses)
+
+    # existing char-based logic
+    if time_based:
+        # ... existing time-based code ...
+        from statistics import mean
+        stats = {}
+        for r in responses:
+            c = r.get('payload', '')
+            if len(c) != 1: continue
+            stats.setdefault(c, []).append(r['response_time'])
+        if not stats: return None
+        avg = {c: sum(t)/len(t) for c, t in stats.items()}
+        global_mean = mean(avg.values())
+        best = max(avg.items(), key=lambda x: x[1] - global_mean)
+        if (best[1] - global_mean) > global_mean * 0.35:
+            return best[0]
+        return None
     else:
-        # Non-time-based analysis
-        pattern_counts = Counter(
-            (e['chars'], e['words'], e['lines']) for e in responses
-        )
-        if not pattern_counts:
-            return None
-
-        majority_pattern, _ = pattern_counts.most_common(1)[0]
+        # existing content-deviation logic
+        patterns = Counter((r['chars'], r['words'], r.get('lines',0)) for r in responses)
+        majority, _ = patterns.most_common(1)[0]
         deviations = []
-
-        for e in responses:
-            if e.get('code', 0) < 400:
-                pattern = (e['chars'], e['words'], e['lines'])
-                if pattern != majority_pattern:
-                    dev = sum(abs(a - b) for a, b in zip(pattern, majority_pattern))
-                    deviations.append((dev, e))
-
+        for r in responses:
+            if r.get('code', 0) < 400:
+                patt = (r['chars'], r['words'], r.get('lines',0))
+                if patt != majority:
+                    dev = sum(abs(a-b) for a, b in zip(patt, majority))
+                    deviations.append((dev, r))
         if not deviations:
-            # Fallback: look for single safe char in error responses
-            error_chars = {
-                e.get('candidate_char', ''): e for e in responses
-                if e.get('code', 0) >= 400 and 
-                e.get('candidate_char', '') in SAFE_CHARS
-            }
-            if len(error_chars) == 1:
-                return next(iter(error_chars.keys()))
             return None
-
-        # Find max deviation
-        max_dev = max(dev for dev, _ in deviations)
-        
-        # Get all chars with max deviation
-        probable_chars = set()
-        for dev, e in deviations:
-            if dev == max_dev:
-                char = e.get('candidate_char', '')
-                if char in SAFE_CHARS:
-                    probable_chars.add(char)
-        
-        return next(iter(probable_chars)) if probable_chars else None
+        # pick payload with max deviation
+        best = max(deviations, key=lambda x: x[0])[1]
+        return best.get('payload')
 
 ## ----- Helper Functions ----- ##
 
@@ -246,6 +325,7 @@ def load_dynamic_script(script_path: str):
     return module
 
 def execute_dynamic_script(script_module, data: Dict[str, Any]):
+    global VERBOSE
     """Execute the dynamic script if conditions are met"""
     if not script_module:
         return False
@@ -254,12 +334,15 @@ def execute_dynamic_script(script_module, data: Dict[str, Any]):
         # Check if the script has a condition function
         if hasattr(script_module, 'condition'):
             condition_met = script_module.condition(data)
-            if not condition_met:
+            if not condition_met and VERBOSE:
+                print(f"Skipping script {script_module.__name__} due to condition not met.")
                 return False
         
         # Execute the main function if it exists
         if hasattr(script_module, 'execute'):
             script_module.execute(data)
+            if VERBOSE:
+                print(f"Executed dynamic script: {script_module.__name__}")
             return True
         
         return False
@@ -362,7 +445,10 @@ def parse_fuzz_tokens(text: str) -> List[Dict[str, Any]]:
                 if "=" in opt:
                     key, value = opt.split("=", 1)
                     options[key.strip()] = value.strip()
+                else:
+                    options[opt.strip()] = True
             options.setdefault("set", "alphanum")
+            options.setdefault("append", False)
 
         else:
             # Fallback for unknown modes — raw options as key-value if possible
@@ -442,7 +528,7 @@ class TokenGenerator:
         """Get character set for G mode"""
         charset = self.options.get('set', 'alphanum')
         if charset == 'alphanum': 
-            return string.ascii_letters + string.digits
+            return string.ascii_letters + string.digits + '-_'
         elif charset == 'hex': 
             return string.hexdigits.lower()
         elif charset == 'numeric': 
@@ -479,7 +565,10 @@ class TokenGenerator:
             if self.char_index < len(self.charset):
                 char = self.charset[self.char_index]
                 self.char_index += 1
-                return self.current_string + char
+                if self.options.get('append', False):
+                    return self.current_string + char
+                else:
+                    return char
             return ""
         
         return ""
@@ -497,156 +586,172 @@ class TokenGenerator:
             self.char_index = 0
 
 def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[Dict[str, Any]]:
-    """Fire requests with integrated character analysis."""
-    # Extract parameters
-    method = parameters['method']
-    headers = parameters['headers']
-    body = parameters['body']
-    base_url = parameters['base_url']
-    path = parameters['path']
-    req_url = f"{base_url}{path}"
-    response_filters = parameters['response_filters']
-    fuzz_tokens = parameters.get('FUZZ', [])
-    script_modules = parameters.get('script_modules', [])
-    
-    print(f"Fuzz tokens found: {fuzz_tokens}")
-    
-    # Create token generators
+    """
+    Fire threaded fuzzing requests for both stateful and non-stateful tokens.
+    - If any non-stateful payload triggers the filters, exit early.
+    - If no filters are provided, exhaust all non-stateful payloads, then pick the one
+      whose response length deviates most from the majority.
+    - For stateful (G-mode) tokens, exit as soon as no new character can be distinguished,
+      returning the final assembled string.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    method        = parameters['method']
+    headers       = parameters['headers']
+    body          = parameters['body']
+    base_url      = parameters['base_url']
+    path          = parameters['path']
+    req_url       = f"{base_url}{path}"
+    filters       = parameters.get('response_filters', {}) or {}
+    fuzz_tokens   = parameters.get('FUZZ', [])
+    script_modules= parameters.get('script_modules', [])
+
+    # Initialize generators for each FUZZ token
     token_generators = {}
-    for token_spec in fuzz_tokens:
+    for spec in fuzz_tokens:
         try:
-            token_generators[token_spec['token']] = TokenGenerator(token_spec)
+            token_generators[spec['token']] = TokenGenerator(spec)
         except Exception as e:
-            print(f"Error creating generator: {str(e)}")
+            print(f"Error creating token generator: {e}")
             return []
-    
-    # Track stateful tokens
-    stateful_tokens = [token for token, gen in token_generators.items() if gen.mode == 'G']
-    non_stateful_tokens = [token for token, gen in token_generators.items() if gen.mode != 'G']
-    follow_tokens = {token: gen for token, gen in token_generators.items() 
-                    if gen.mode == 'I' and gen.follow}
-    
+
+    # Categorize tokens
+    stateful      = [t for t, g in token_generators.items() if g.mode == 'G']
+    non_stateful  = [t for t, g in token_generators.items() if g.mode != 'G']
+    follow_tokens = {t: g for t, g in token_generators.items() if g.mode == 'I' and g.follow}
+
     results = []
-    request_count = 0
-    
-    # Create thread pool
-    # max_workers = 10 if not time_based else 10
+    all_nonstateful_resps = []
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        while True:
-            # Update follow tokens with current guessed lengths
-            for token, gen in follow_tokens.items():
-                gen.guessed_length = max(
-                    len(token_generators[t].current_string) for t in stateful_tokens
-                ) if stateful_tokens else 0
-            
-            # Get base replacements for non-stateful tokens
-            base_replacements = {}
-            try:
-                for token in non_stateful_tokens:
-                    base_replacements[token] = token_generators[token].get_payload()
-            except Exception:
-                break  # Exit when non-stateful tokens are exhausted
-            
-            # Process stateful tokens
-            for token in stateful_tokens:
-                gen = token_generators[token]
-                current_length = len(gen.current_string)
-                
-                # Skip if max length reached
-                if current_length >= 50:
+        # If there are no stateful tokens, first exhaust all non-stateful payloads
+        if not stateful:
+            nonstateful_futures: Dict = {}
+            while True:
+                # build next payload set
+                repl = {t: token_generators[t].get_payload() for t in non_stateful}
+                # stop when any generator returns empty string
+                if any(val == "" for val in repl.values()):
+                    break
+
+                # prepare headers/body
+                new_h = {k: v for k, v in headers.items()}
+                for k, v in new_h.items():
+                    for tok, val in repl.items():
+                        v = v.replace(tok, val)
+                    new_h[k] = v
+                new_b = body
+                for tok, val in repl.items():
+                    new_b = new_b.replace(tok, val)
+
+                # submit request
+                fut = executor.submit(
+                    send_request,
+                    req_url, method, new_h, new_b,
+                    filters,
+                    payload=str(repl),
+                    script_modules=script_modules
+                )
+                nonstateful_futures[fut] = repl
+
+            # collect all non-stateful responses
+            for fut in as_completed(nonstateful_futures):
+                repl = nonstateful_futures[fut]
+                resp = fut.result()[0]
+                all_nonstateful_resps.append((repl, resp))
+                results.append(resp)
+                # if any filter is active and this resp passes, exit immediately
+                if any(v is not None for v in filters.values()) and resp.get('show_response'):
+                    print(f"\n🔑 Found matching non-stateful payload: {repl}")
+                    return [resp]
+
+        # Otherwise, or after exhausting non-stateful, handle stateful character guessing
+        while stateful:
+            # update follow‑length tokens
+            for t, g in follow_tokens.items():
+                g.guessed_length = max(len(token_generators[s].current_string) for s in stateful)
+
+            futures: Dict = {}
+            # submit one request per candidate character per token
+            for t in stateful:
+                gen = token_generators[t]
+                if len(gen.current_string) >= 50:
                     continue
-                
-                # Prepare all candidate characters
-                responses = []
-                futures = {}
-                charset = gen.charset
+                for idx, ch in enumerate(gen.charset):
+                    if gen.options.get('append', False):
+                        candidate = gen.current_string + ch
+                    else:
+                        candidate = ch
+                    repl = {x: token_generators[x].get_payload() for x in non_stateful}
+                    repl[t] = candidate
 
-                for idx, char in enumerate(charset):
-                    # Generate candidate payload
-                    candidate = gen.current_string + char
-                    token_replacements = base_replacements.copy()
-                    token_replacements[token] = candidate
-                    
-                    # Prepare request
-                    new_headers = headers.copy()
-                    for key, value in new_headers.items():
-                        for t, repl in token_replacements.items():
-                            value = value.replace(t, repl)
-                        new_headers[key] = value
-                    
-                    new_body = body
-                    for t, repl in token_replacements.items():
-                        new_body = new_body.replace(t, repl)
-                    
-                    # Submit request
-                    future = executor.submit(
+                    new_h = {k: v for k, v in headers.items()}
+                    for k, v in new_h.items():
+                        for tok, val in repl.items():
+                            v = v.replace(tok, val)
+                        new_h[k] = v
+                    new_b = body
+                    for tok, val in repl.items():
+                        new_b = new_b.replace(tok, val)
+
+                    fut = executor.submit(
                         send_request,
-                        req_url, method, new_headers, new_body, 
-                        response_filters,
+                        req_url, method, new_h, new_b,
+                        filters,
                         idx=idx, payload=candidate,
-                        script_modules=script_modules,
+                        script_modules=script_modules
                     )
-                    futures[future] = {
-                        'char': char,
-                        'candidate': candidate,
-                        'token': token
-                    }
-                # Collect all responses
-                for future in as_completed(futures):
-                    try:
-                        response = future.result()[0]
+                    futures[fut] = (t, ch)
 
-                        meta = futures[future]
-                        
-                        # Add analysis metadata
-                        response.update({
-                            'candidate_char': meta['char'],
-                            'candidate_string': meta['candidate'],
-                            'token': meta['token']
-                        })
-                        
-                        responses.append(response)
-                        request_count += 1
-                        # print(f"\r🔥 Request #{request_count}: {meta['char']} ", end="")
-                    except Exception as e:
-                        print(f"\nRequest error: {str(e)}")
-                
-                # Analyze responses to find probable character
-                probable_char = analyze_responses(responses, time_based)
-                
-                if probable_char:
-                    # Confirm successful guess
-                    full_guess = gen.current_string + probable_char
-                    gen.confirm_guess(full_guess)
-                    print(f"\n✅ Found char '{probable_char}' at position {current_length}")
+            # collect responses
+            grouped = {t: [] for t in stateful}
+            for fut in as_completed(futures):
+                resp = fut.result()[0]
+                t, ch = futures[fut]
+                resp.update({'candidate_char': ch, 'token': t})
+                grouped[t].append(resp)
+                results.append(resp)
+
+            # analyze and update each stateful token
+            progress = False
+            for t in list(stateful):
+                grp = grouped.get(t, [])
+                if not grp:
+                    continue
+                probable = analyze_responses(grp, time_based)
+                gen = token_generators[t]
+                if probable:
+                    if gen.options.get('append', False):
+                        gen.current_string = probable
+                    else:
+                        gen.current_string = gen.current_string + probable
+                    print(f"\n✅ Token '{t}' extended to: {gen.current_string}")
+                    progress = True
                 else:
-                    # Advance to next position
-                    gen.advance_position()
-                    print(f"\nℹ️ Advanced to position {current_length + 1}")
-            
-            # Send verification request
-            final_replacements = base_replacements.copy()
-            for token in stateful_tokens:
-                final_replacements[token] = token_generators[token].current_string
-            
-            new_headers = headers.copy()
-            for key, value in new_headers.items():
-                for token, repl in final_replacements.items():
-                    value = value.replace(token, repl)
-                new_headers[key] = value
-            
-            new_body = body
-            for token, repl in final_replacements.items():
-                new_body = new_body.replace(token, repl)
-            
-            print(f"\n🚀 Verification request with state: {final_replacements}")
-            response = send_request(
-                req_url, method, new_headers, new_body, response_filters, time_based
-            )
-            results.extend(response)
-            request_count += 1
-    
-    print("\n✅ All tokens processed")
+                    # no distinguishing char → final value reached
+                    final_val = gen.current_string
+                    print(f"\n🏁 Token '{t}' final value: {final_val}")
+                    stateful.remove(t)
+
+            if not progress:
+                break  # no further progress
+
+    # Post‐processing for pure non‐stateful when no filters were provided
+    if not stateful and all(v is None for v in filters.values()) and all_nonstateful_resps:
+        # Extract just the response dicts
+        flat_resps = [resp for _, resp in all_nonstateful_resps]
+
+        # Delegate to our unified analyzer (will pick the 2xx or best‑length payload)
+        successful = find_successful_wordlist_payload(flat_resps, time_based=False)
+
+        if successful:
+            # Find and return only the matching response(s)
+            matched = [r for r in flat_resps if r.get('payload') == successful]
+            print(f"\\n🔑 Wordlist attack succeeded with payload: {successful}")
+            return matched
+        else:
+            print("\\n⚠️ No successful payload found in wordlist attack.")
+
     return results
 
 def send_request(
@@ -657,7 +762,8 @@ def send_request(
     filters: Dict[str, Any],
     idx: int = 0,
     payload: str = "",
-    script_modules: Optional[List[Any]] = None
+    script_modules: Optional[List[Any]] = None,
+    print_response: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
     global VERBOSE
     """Send a request and return filter status + summary."""
@@ -665,9 +771,12 @@ def send_request(
         response = requests.request(
             method, req_url, headers=headers, data=body, timeout=10
         )
+        if print_response:
+            print(f"{response.text}")
+
         show_response = True
         if VERBOSE:
-            print(f"🔥 Sending request #{idx + 1} to {req_url} with payload: {payload}")
+            print(f"🔥 Sending request #{idx + 1} to {req_url} with payload: {payload}, idx: {idx}")
         # Apply response filters
         for key, filter_val in filters.items():
             if filter_val is None:
@@ -702,7 +811,7 @@ def send_request(
         if script_modules:
             for script_module in script_modules:
                 execute_dynamic_script(script_module, summary)
-                
+
         return [summary]
     
     except requests.RequestException as e:
@@ -717,52 +826,9 @@ def send_request(
             'show_response': False
         }]
     
-def guess_time_based(parameters: Dict[str, Any], deviation: float) -> str:
-    """Build parameters for time-based guessing."""
-    guessed_string = ""
-
-    wordlist = open(parameters['wordlist'], 'r').read().splitlines()
-    method = parameters['method']
-    headers = parameters['headers']
-    body = parameters['body']
-    base_url = parameters['base_url']
-    req_url = f"{base_url}{parameters['path']}"
-
-    while True:
-        print(f"\n🔥 Guessing next character with current string: '{guessed_string}'")
-        results = []
-
-        with ThreadPoolExecutor() as executor:
-            futures = {}
-            if 'FIZZIR' in req_url or 'FIZZIR' in body or any('FIZZIR' in v for v in headers.values()):
-                futures = {
-                    executor.submit(async_send_request, req_url, method, headers, body, word, idx + 1): word
-                    for idx, word in enumerate(wordlist)
-                }
-            else:
-                futures = {executor.submit(async_send_request, req_url, method, headers, body, word, len(guessed_string)): word for word in wordlist}
-            for future in as_completed(futures):
-                word = futures[future]
-                try:
-                    response = future.result()
-                    if response:
-                        results.extend(response)
-                except Exception as e:
-                    print(f"Error processing word '{word}': {e}")
-
-        if not results:
-            return "No results found."
-        chars = find_most_probable_time_based_character(results, deviation)
-        if chars != False:
-            guessed_string += chars['most_probable']
-            print(f"Guessed character: '{chars['most_probable']}' -> Current string: '{guessed_string}'")
-        else:
-            print("No significant deviation found. Stopping guessing.")
-            print("Final guessed string:", guessed_string)
-            break
-
 def main() -> None:
     global VERBOSE
+    global MAX_WORKERS
 
     parser = argparse.ArgumentParser(description="Convert request file to fuzzing tool.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -782,13 +848,17 @@ def main() -> None:
     run_parser.add_argument("--script", action="append", help="Conditional scripts to run on the response")
 
     run_parser.add_argument("--https", action="store_true") # HTTP per default unless specified
-    
+        
     run_parser.add_argument("--time-based", action="store_true", help="Enable time-based guessing")
     run_parser.add_argument("--time-based-deviation", type=float, default=0.35, help="Deviation threshold for time-based guessing (default: 0.35)")
 
-    run_parser.add_argument("--dry-run", "--dr", action="store_true", help="Dry run: show parsed parameters without executing requests")
+    run_parser.add_argument("--max-workers", type=int, default=MAX_WORKERS, help="Maximum number of concurrent workers (default: 10)")
 
+    run_parser.add_argument("--test-single", action="store_true", help="Test single request with the given parameters and print the response")
+
+    run_parser.add_argument("--dry-run", "--dr", action="store_true", help="Dry run: show parsed parameters without executing requests")
     run_parser.add_argument("-v", action="store_true", help="Verbose mode: print more details")
+
     args = parser.parse_args()
 
     if args.v:
@@ -797,6 +867,11 @@ def main() -> None:
     if args.command == "run":
         if VERBOSE:
             print(f"Running with arguments: {args}")
+        
+        if args.max_workers:
+            MAX_WORKERS = args.max_workers
+            if VERBOSE:
+                print(f"Setting max workers to {MAX_WORKERS}")
             
         method, path, headers, body, base_url = parse_request_file(args.request_file)
         if not base_url and not args.base_url:
@@ -813,7 +888,7 @@ def main() -> None:
 
         params = build_custom_parameters(method, path, headers, body, args)
 
-        if VERBOSE:
+        if VERBOSE and not args.test_single:
             print(f"Parsed parameters: {json.dumps(params, indent=2)}")
         
         if args.dry_run:
@@ -834,6 +909,50 @@ def main() -> None:
                     print(f"Failed to load dynamic script: {script_path}")
         params['script_modules'] = script_modules
 
+        if args.test_single:
+            # Test single request with the given parameters
+            print("Testing single request with parameters:")
+
+            # Get first word of the wordlist if available
+            if 'FUZZ' in params and params['FUZZ']:
+                for token in params['FUZZ']:
+                    if token['mode'] == 'W' and 'wordlist' in token['options']:
+                        wordlist_path = token['options']['wordlist']
+                        if os.path.exists(wordlist_path):
+                            with open(wordlist_path, 'r') as f:
+                                first_word = f.readline().strip()
+                                params['body'] = params['body'].replace(token['token'], first_word)
+                                params['headers'] = {k: v.replace(token['token'], first_word) for k, v in params['headers'].items()}
+                                params['path'] = params['path'].replace(token['token'], first_word)
+                                
+                    elif token['mode'] == 'I' and 'start' in token['options']:
+                        # For integer tokens, replace with the start value
+                        start_value = token['options'].get('start', '0')
+                        params['body'] = params['body'].replace(token['token'], start_value)
+                        params['headers'] = {k: v.replace(token['token'], start_value) for k, v in params['headers'].items()}
+                        params['path'] = params['path'].replace(token['token'], start_value)
+
+                    elif token['mode'] == 'G' and 'set' in token['options']:
+                        # For character guessing tokens, replace with the first character of the set
+                        charset = token['options'].get('set', 'alphanum')
+                        first_char = charset[0] if charset else '?'
+                        params['body'] = params['body'].replace(token['token'], first_char)
+                        params['headers'] = {k: v.replace(token['token'], first_char) for k, v in params['headers'].items()}
+                        params['path'] = params['path'].replace(token['token'], first_char)
+
+            else:
+                print("No FUZZ tokens found in parameters, using original body and headers.")
+            filtered_params = {k: v for k, v in params.items() if k != 'script_modules'}
+
+            print(json.dumps(filtered_params, indent=2))
+
+            response = send_request(
+                f"{params['base_url']}{params['path']}", params['method'], params['headers'], 
+                params['body'], params['response_filters'], print_response=True,
+            )
+            print(f"Response: {json.dumps(response, indent=2)}")
+            return
+        
         result = fire_requests(params, time_based=args.time_based)
         if VERBOSE:
             print(f"Results: {json.dumps(result, indent=2)}")

