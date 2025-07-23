@@ -6,7 +6,6 @@ Converts a HTTP(S) request file into fuzzing requests.
 and optionally performs character-by-character fuzzing.
 """
 import argparse
-from ast import Str
 import json
 import os
 import string
@@ -22,6 +21,7 @@ import re
 
 VERBOSE = False
 MAX_WORKERS = 10  # Default max workers for ThreadPoolExecutor
+MAX_CONCURRENT_REQUESTS = 300  # Max concurrent requests per token
 DEFAULT_WORDLISTS = {
     'rockyou' : '~/wordlist/rockyou.txt',
     'directories' : '~/wordlist/directory-list-2.3-small.txt',
@@ -326,6 +326,7 @@ class TokenGenerator:
             self.current_value = self.start
             self.follow = self.options.get('follow', False)
             self.padding = int(self.options.get('padding', 0))
+            self.stop_at_end = self.options.get('stop_at_end', False)
             
         elif self.mode == 'W':
             self.wordlist = self.options['wordlist']
@@ -363,6 +364,11 @@ class TokenGenerator:
                 payload = str(self.current_value)
                 if self.current_value <= self.end:
                     self.current_value += self.step
+                elif self.current_value > self.end:
+                    if self.stop_at_end:
+                        return ""
+                    else:
+                        self.current_value = self.start
                 return payload.rjust(self.padding, '0')
                 
         elif self.mode == 'W':
@@ -438,35 +444,64 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # If there are no stateful tokens, first exhaust all non-stateful payloads
         if not stateful:
-            nonstateful_futures: Dict = {}
-            while True:
-                # build next payload set
-                repl = {t: token_generators[t].get_payload() for t in non_stateful}
-                # stop when any generator returns empty string
-                if any(val == "" for val in repl.values()):
-                    break
+            if no_postprocess:
+                # Run in parallel but discard results immediately
+                futures = []
+                concurrent_requests = 0
+                while True:
+                    repl = {t: token_generators[t].get_payload() for t in non_stateful}
+                    if any(val == "" for val in repl.values()):
+                        break
 
-                # prepare headers/body
-                new_h = {k: v for k, v in headers.items()}
-                for k, v in new_h.items():
+                    new_h = {k: v for k, v in headers.items()}
+                    for k, v in new_h.items():
+                        for tok, val in repl.items():
+                            v = v.replace(tok, val)
+                        new_h[k] = v
+                    new_b = body
                     for tok, val in repl.items():
-                        v = v.replace(tok, val)
-                    new_h[k] = v
-                new_b = body
-                for tok, val in repl.items():
-                    new_b = new_b.replace(tok, val)
+                        new_b = new_b.replace(tok, val)
 
-                if no_postprocess:
-                    # Wait for response immediately and discard
-                    _ = send_request(
+                    fut = executor.submit(
+                        send_request,
                         req_url, method, new_h, new_b,
                         filters,
                         payload=str(repl),
                         script_modules=script_modules,
                         no_postprocess=True
                     )
-                    # No storing of repl or response
-                else:
+                    futures.append(fut)
+                    concurrent_requests += 1
+                    if concurrent_requests >= MAX_CONCURRENT_REQUESTS:
+                        # Wait for some futures to complete before submitting more
+                        if VERBOSE:
+                            print(f"Waiting for {concurrent_requests} concurrent requests to complete...")
+                        concurrent_requests = 0
+                        for fut in as_completed(futures):
+                            try:
+                                _ = fut.result()  # Trigger execution and free result
+                            except Exception as e:
+                                if VERBOSE:
+                                    print(f"Request error: {e}")
+                return []  # done
+            else:
+                # Store futures and results when postprocessing is needed
+                nonstateful_futures: Dict = {}
+
+                while True:
+                    repl = {t: token_generators[t].get_payload() for t in non_stateful}
+                    if any(val == "" for val in repl.values()):
+                        break
+
+                    new_h = {k: v for k, v in headers.items()}
+                    for k, v in new_h.items():
+                        for tok, val in repl.items():
+                            v = v.replace(tok, val)
+                        new_h[k] = v
+                    new_b = body
+                    for tok, val in repl.items():
+                        new_b = new_b.replace(tok, val)
+
                     fut = executor.submit(
                         send_request,
                         req_url, method, new_h, new_b,
@@ -477,19 +512,14 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                     )
                     nonstateful_futures[fut] = repl
 
-            # collect all non-stateful responses
-            if not no_postprocess:
                 for fut in as_completed(nonstateful_futures):
                     repl = nonstateful_futures[fut]
                     resp = fut.result()[0]
                     all_nonstateful_resps.append((repl, resp))
                     results.append(resp)
-                    # if any filter is active and this resp passes, exit immediately
                     if any(v is not None for v in filters.values()) and resp.get('show_response'):
                         if VERBOSE:
                             print(f"\n🔑 Found matching non-stateful payload: {repl}")
-            else: 
-                return []  # no post-processing, return collected results
 
         # Otherwise, or after exhausting non-stateful, handle stateful character guessing
         while stateful:
@@ -604,10 +634,12 @@ def send_request(
 ) -> Optional[Tuple[bool, Dict[str, Any]]]:
     global VERBOSE
     """Send a request and return filter status + summary."""
+
     try:
         response = requests.request(
             method, req_url, headers=headers, data=body, timeout=10
         )
+
         if print_response:
             print(f"{response.text}")
 
@@ -620,7 +652,6 @@ def send_request(
                 continue
                 
             response_text = response.text
-            
             if key == 'hide_length' and response_text:
                 if len(response_text) == filter_val:
                     show_response = False
@@ -635,7 +666,17 @@ def send_request(
                 show_response = False
             elif key == 'hide_string' and filter_val in response_text:
                 show_response = False
-        
+
+        if no_postprocess:
+            if show_response:
+                print(f"🔍 Response for payload passed filters {payload}")
+                print(f"\n\n\n\n\n\n{response.text}\n\n\n\n\n")
+                print(f"🔥 Request #{idx + 1} to {req_url} with payload: {payload}, idx: {idx}")
+                print(f"#----------------------------------#")
+                print(f"Response code: {response.status_code}")
+            return
+
+
         summary = {
             'code': response.status_code,
             'chars': len(response.text),
@@ -645,15 +686,12 @@ def send_request(
             'idx' : idx,
             'show_response': show_response
         }
+
+
         if script_modules:
             for script_module in script_modules:
                 execute_dynamic_script(script_module, summary)
-
-        if no_postprocess:
-            if show_response:
-                print(f"🔍 Response for payload passed filters {payload}: {summary}")
-        else:
-            return [summary]
+        return [summary]
     
     except requests.RequestException as e:
         print(f"Request failed: {e}")
@@ -673,6 +711,7 @@ def send_request(
 def main() -> None:
     global VERBOSE
     global MAX_WORKERS
+    global MAX_CONCURRENT_REQUESTS
 
     parser = argparse.ArgumentParser(description="Convert request file to fuzzing tool.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -698,6 +737,7 @@ def main() -> None:
     run_parser.add_argument("--no-postprocess", "--npp", action="store_true") # HTTP per default unless specified
 
     run_parser.add_argument("--max-workers", type=int, default=MAX_WORKERS, help="Maximum number of concurrent workers (default: 10)")
+    run_parser.add_argument("--max-concurrent-requests", type=int, default=MAX_CONCURRENT_REQUESTS, help="Maximum concurrent requests per token (default: 300)")
 
     run_parser.add_argument("--test-single", action="store_true", help="Test single request with the given parameters and print the response")
 
@@ -706,17 +746,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.max_workers:
+        MAX_WORKERS = args.max_workers
+        if VERBOSE:
+            print(f"Setting max workers to {MAX_WORKERS}")
+
+    if args.max_concurrent_requests:
+        MAX_CONCURRENT_REQUESTS = args.max_concurrent_requests
+        if VERBOSE:
+            print(f"Setting max concurrent requests to {MAX_CONCURRENT_REQUESTS}")
+
     if args.v:
         VERBOSE = True
 
     if args.command == "run":
         if VERBOSE:
             print(f"Running with arguments: {args}")
-        
-        if args.max_workers:
-            MAX_WORKERS = args.max_workers
-            if VERBOSE:
-                print(f"Setting max workers to {MAX_WORKERS}")
             
         method, path, headers, body, base_url = parse_request_file(args.request_file)
         if not base_url and not args.base_url:
