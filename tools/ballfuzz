@@ -75,6 +75,10 @@ def analyze_responses(responses, time_based=False):
     #     return find_successful_wordlist_payload(responses)
 
     # existing char-based logic
+    if len(responses) == 0:
+        return None
+    if len(responses) == 1:
+        return responses[0].get('payload')
     if time_based:
         # ... existing time-based code ...
         from statistics import mean
@@ -96,7 +100,7 @@ def analyze_responses(responses, time_based=False):
         majority, _ = patterns.most_common(1)[0]
         deviations = []
         for r in responses:
-            if r.get('code', 0) < 400:
+            if r.get('code', 0) < 600:
                 patt = (r['chars'], r['words'], r.get('lines',0))
                 if patt != majority:
                     dev = sum(abs(a-b) for a, b in zip(patt, majority))
@@ -172,7 +176,8 @@ def parse_request_file(path: str) -> Tuple[str, str, Dict[str, str], str]:
     """Parse Burp HTTP request file into method, path, headers, body."""
     with open(path, 'r') as f:
         lines = f.read().splitlines()
-    method, req_path, _ = lines[0].split(maxsplit=2)
+    print(f"Lines: {lines}")
+    method, req_path, _ = lines[0].split(" ", maxsplit=2)
     headers, body_lines, in_body = {}, [], False
     for line in lines[1:]:
         if not in_body and not line.strip():
@@ -452,7 +457,11 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                     repl = {t: token_generators[t].get_payload() for t in non_stateful}
                     if any(val == "" for val in repl.values()):
                         break
-
+                    
+                    new_url = req_url
+                    for tok, val in repl.items():
+                        new_url = new_url.replace(tok, val)
+                
                     new_h = {k: v for k, v in headers.items()}
                     for k, v in new_h.items():
                         for tok, val in repl.items():
@@ -464,7 +473,7 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
 
                     fut = executor.submit(
                         send_request,
-                        req_url, method, new_h, new_b,
+                        new_url, method, new_h, new_b,
                         filters,
                         payload=str(repl),
                         script_modules=script_modules,
@@ -492,6 +501,10 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                     repl = {t: token_generators[t].get_payload() for t in non_stateful}
                     if any(val == "" for val in repl.values()):
                         break
+                    
+                    new_url = req_url
+                    for tok, val in repl.items():
+                        new_url = new_url.replace(tok, val)
 
                     new_h = {k: v for k, v in headers.items()}
                     for k, v in new_h.items():
@@ -504,7 +517,7 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
 
                     fut = executor.submit(
                         send_request,
-                        req_url, method, new_h, new_b,
+                        new_url, method, new_h, new_b,
                         filters,
                         payload=str(repl),
                         script_modules=script_modules,
@@ -542,6 +555,11 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
                     repl = {x: token_generators[x].get_payload() for x in non_stateful}
                     repl[t] = candidate
 
+                    new_url = req_url
+                    for tok, val in repl.items():
+                        new_url = new_url.replace(tok, val)
+
+
                     new_h = {k: v for k, v in headers.items()}
                     for k, v in new_h.items():
                         for tok, val in repl.items():
@@ -553,7 +571,7 @@ def fire_requests(parameters: Dict[str, Any], time_based: bool = False) -> List[
 
                     fut = executor.submit(
                         send_request,
-                        req_url, method, new_h, new_b,
+                        new_url, method, new_h, new_b,
                         filters,
                         idx=idx, payload=candidate,
                         script_modules=script_modules
