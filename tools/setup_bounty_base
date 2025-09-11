@@ -1,0 +1,362 @@
+#!/bin/env python3
+import os
+import json
+import subprocess
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import tempfile
+import shutil
+import datetime
+import re
+import idna
+
+# ANSI color codes
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+extra_header = ""
+REDIRECT_CODES = {300,301,302,303,307,308}
+
+def run_cmd(cmd, cwd=None, stdout_file=None, allow_empty_stdout=True, timeout=None):
+    print(f"{Colors.OKBLUE}{Colors.BOLD}Running:{Colors.ENDC} {Colors.OKCYAN}{cmd}{Colors.ENDC}")
+    with subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    ) as process:
+        wrote_output = False
+        if stdout_file:
+            with open(Path(cwd or ".") / stdout_file, "w") as f:
+                for line in process.stdout:
+                    f.write(line)
+                    wrote_output = True
+        else:
+            for line in process.stdout:
+                print(f"{Colors.OKGREEN}{line.rstrip()}{Colors.ENDC}")
+                wrote_output = True
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise RuntimeError(f"Timeout: {cmd}")
+        if process.returncode != 0:
+            raise RuntimeError(f"Command failed ({process.returncode}): {cmd}")
+        if not wrote_output and not allow_empty_stdout:
+            raise RuntimeError(f"No stdout produced by: {cmd}")
+
+def process_wildcard(domain, base_dir):
+    print(f"{Colors.HEADER}{Colors.BOLD}Processing: {domain}{Colors.ENDC}")
+    clean_domain = domain.replace("*.", "").strip()
+    try:
+        ascii_domain = idna.encode(clean_domain).decode('utf-8')
+    except Exception as e:
+        print(f"{Colors.WARNING}IDNA encoding failed for {clean_domain}: {e}. Using original domain.{Colors.ENDC}")
+        ascii_domain = clean_domain
+
+    folder = base_dir / ascii_domain
+    folder.mkdir(parents=True, exist_ok=True)
+
+    subs_file = f"{ascii_domain}.txt"
+    alive_subs_file = f"{ascii_domain}_alive.txt"
+    urls_file = "urls"
+    alive_file = "alive_urls"
+    katana_file = "katana_urls"
+    merged_urls_file = "all_urls"
+    amass_file = "amass.txt"
+    pretty_httpx = "pretty_httpx.txt"
+
+    # 1: findomain (creates subs file automatically with -o)
+    if not (folder / subs_file).exists():
+        run_cmd(f"findomain -t {ascii_domain} -r -o", cwd=folder)
+
+        # findomain names the file <domain>.txt in current dir already; ensure rename if mismatch
+        generated = folder / f"{ascii_domain}.txt"
+        if not generated.exists():
+            # fallback: move first *.txt if ambiguous
+            txts = list(folder.glob("*.txt"))
+            if txts:
+                txts[0].rename(generated)
+
+    # 2: amass merge
+    if not (folder / amass_file).exists():
+        try:
+            run_cmd(f"amass enum -d {ascii_domain} -o {amass_file} -active", cwd=folder)
+            run_cmd(f"cat {subs_file} {amass_file} | sort -u > {subs_file}.tmp && mv {subs_file}.tmp {subs_file}", cwd=folder)
+        except RuntimeError as e:
+            print(f"{Colors.WARNING}Amass failed: {e}{Colors.ENDC}")
+
+    # httpx alive subdomains only
+    if not (folder / alive_subs_file).exists():
+        httpx_cmd = f"httpx -silent"
+        if extra_header:
+            httpx_cmd += f" -H '{extra_header}'"
+        run_cmd(f"cat {subs_file} | {httpx_cmd} > {alive_subs_file}", cwd=folder)
+
+    # 3: gau
+    if not (folder / urls_file).exists():
+        run_cmd(f"cat {alive_subs_file} | gau > {urls_file}", cwd=folder)
+
+    # 4: httpx alive
+    if not (folder / alive_file).exists():
+        httpx_cmd = f"httpx -silent"
+        if extra_header:
+            httpx_cmd += f" -H '{extra_header}'"
+        run_cmd(f"cat {urls_file} | {httpx_cmd} > {alive_file}", cwd=folder)
+
+    # 5: katana (skip if no alive_urls or empty)
+    if not (folder / katana_file).exists():
+        if (folder / alive_file).exists() and os.path.getsize(folder / alive_file) > 0:
+            katana_base = f"katana -list {alive_file} -o {katana_file} -d 3 -jc -kf all -silent"
+            if extra_header:
+                katana_base += f" -H '{extra_header}'"
+            # generous timeout (30m previously). Keep 20m.
+            run_cmd(f"timeout 20m {katana_base}", cwd=folder, allow_empty_stdout=True)
+        else:
+            open(folder / katana_file, "w").close()
+
+    # 6: merge URLs
+    if not (folder / merged_urls_file).exists():
+        run_cmd(f"cat {urls_file} {katana_file} | sort -u > {merged_urls_file}", cwd=folder)
+
+    # 7: classify/sort
+    if not (folder / "sorted_urls.txt").exists():
+        try:
+            run_cmd(f"sort_urls {merged_urls_file}", cwd=folder)
+            # create an index file summary for quick check
+            run_cmd("find sorted_urls -type f -maxdepth 1 -printf '%f %s bytes\\n' > sorted_urls.txt", cwd=folder)
+        except RuntimeError as e:
+            print(f"{Colors.WARNING}sort_urls failed: {e}{Colors.ENDC}")
+
+    # 8: pretty httpx per subdomain (tech + status)
+    if not (folder / pretty_httpx).exists():
+        run_cmd(f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}", cwd=folder)
+
+    # 9: light sensitive endpoint enumeration (optional, ignore failures)
+    try:
+        run_cmd(f"enumerate_domains_2 {pretty_httpx} 2 http://localhost:1340", cwd=folder, allow_empty_stdout=True)
+    except Exception as e:
+        print(f"{Colors.WARNING}enumerate_domains_2 failed: {e}{Colors.ENDC}")
+
+    print(f"{Colors.OKGREEN}Processing for {domain} completed. Temp results in {folder}{Colors.ENDC}")
+
+def parse_pretty_httpx(path: Path):
+    results = []
+    if not path.exists():
+        return results
+    # Example line: https://sub.example.com [301] [len:0] [cloudflare] [Title: ...] => https://www.example.com/
+    for line in path.read_text(errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        entry = {
+            "raw": line,
+            "url": None,
+            "status": None,
+            "length": None,
+            "tech": [],
+            "title": "",
+            "location": None
+        }
+        parts = line.split()
+        entry["url"] = parts[0]
+        status_match = re.search(r"\[(\d{3})\]", line)
+        if status_match:
+            entry["status"] = int(status_match.group(1))
+        length_match = re.search(r"\[len:(\d+)\]", line, re.I)
+        if length_match:
+            entry["length"] = int(length_match.group(1))
+        # tech blocks appear as [Apache],[nginx] etc.
+        tech_matches = re.findall(r"\[([A-Za-z0-9 ._-]+)\]", line)
+        # First bracket usually status, second maybe len, rest tech/title chain; simplistic filter
+        filtered = []
+        for t in tech_matches:
+            if t.isdigit() or t.startswith("len:"):
+                continue
+            if t.lower().startswith("title"):
+                entry["title"] = t
+            elif t.lower().startswith("location:"):
+                entry["location"] = t.split(":",1)[1].strip()
+            else:
+                filtered.append(t)
+        entry["tech"] = filtered
+        # extract '=> location' fallback
+        if entry["location"] is None:
+            arrow_loc = re.search(r"=>\s*(\S+)", line)
+            if arrow_loc:
+                entry["location"] = arrow_loc.group(1)
+        results.append(entry)
+    return results
+
+def analyze_domain(domain_dir: Path):
+    domain = domain_dir.name
+    subs_file = domain_dir / f"{domain}.txt"
+    urls_file = domain_dir / "urls"
+    alive_file = domain_dir / "alive_urls"
+    merged_urls_file = domain_dir / "all_urls"
+    pretty_httpx = domain_dir / "pretty_httpx.txt"
+    sorted_dir = domain_dir / "sorted_urls"
+
+    subs_count = sum(1 for _ in open(subs_file)) if subs_file.exists() else 0
+    alive_count = sum(1 for _ in open(alive_file)) if alive_file.exists() else 0
+    merged_count = sum(1 for _ in open(merged_urls_file)) if merged_urls_file.exists() else 0
+
+    httpx_entries = parse_pretty_httpx(pretty_httpx)
+    redirect_only_hosts = []
+    live_hosts = []
+    host_statuses = {}
+    for e in httpx_entries:
+        host = e["url"].split("//",1)[-1].split("/",1)[0]
+        host_statuses.setdefault(host, []).append(e["status"])
+    for host, statuses in host_statuses.items():
+        if all(s in REDIRECT_CODES for s in statuses):
+            redirect_only_hosts.append(host)
+        else:
+            live_hosts.append(host)
+
+    # Collect interesting pattern counts from merged_urls
+    interesting_patterns = {
+        "login": r"login",
+        "admin": r"admin",
+        "config": r"config",
+        "token": r"token",
+        "session": r"session",
+        "auth": r"auth",
+        "debug": r"debug",
+    }
+    pattern_hits = {k:0 for k in interesting_patterns}
+    if merged_urls_file.exists():
+        with open(merged_urls_file) as f:
+            for line in f:
+                low = line.lower()
+                for k, pat in interesting_patterns.items():
+                    if pat in low:
+                        pattern_hits[k] += 1
+
+    # Count sorted buckets
+    sorted_counts = {}
+    if sorted_dir.exists():
+        for f in sorted_dir.glob("*.txt"):
+            try:
+                c = sum(1 for _ in open(f))
+                sorted_counts[f.name] = c
+            except:
+                pass
+
+    score = 0
+    score += min(subs_count,50)/50 * 2
+    score += min(alive_count,500)/500 * 3
+    score += sum(1 for v in pattern_hits.values() if v>0) * 2
+    score += (len(live_hosts) - len(redirect_only_hosts)) * 0.2
+    score = round(score,2)
+
+    return {
+        "domain": domain,
+        "subdomains_total": subs_count,
+        "alive_urls": alive_count,
+        "merged_urls": merged_count,
+        "unique_hosts_live": len(live_hosts),
+        "unique_hosts_redirect_only": len(redirect_only_hosts),
+        "redirect_only_hosts_sample": redirect_only_hosts[:10],
+        "interesting_pattern_counts": pattern_hits,
+        "sorted_category_counts": sorted_counts,
+        "risk_score": score
+    }
+
+def generate_reports(run_dir: Path):
+    report_items = []
+    for d in run_dir.iterdir():
+        if d.is_dir() and (d / f"{d.name}.txt").exists():
+            try:
+                report_items.append(analyze_domain(d))
+            except Exception as e:
+                print(f"{Colors.WARNING}Report analysis failed for {d.name}: {e}{Colors.ENDC}")
+
+    report_items.sort(key=lambda x: x["risk_score"], reverse=True)
+    summary = {
+        "run_directory": str(run_dir),
+        "generated_at": datetime.datetime.utcnow().isoformat()+"Z",
+        "domains_processed": len(report_items),
+        "top_domain": report_items[0]["domain"] if report_items else None
+    }
+    full = {"summary": summary, "domains": report_items}
+
+    # Write JSON
+    (run_dir / "report.json").write_text(json.dumps(full, indent=2))
+    # Write concise text report
+    lines = []
+    lines.append(f"Bug Bounty Enumeration Report ({summary['generated_at']})")
+    lines.append(f"Run directory: {run_dir}")
+    lines.append(f"Domains processed: {summary['domains_processed']}")
+    lines.append("")
+    for item in report_items:
+        lines.append(f"== {item['domain']} ==")
+        lines.append(f" Subdomains: {item['subdomains_total']} | Alive URLs: {item['alive_urls']} | Merged URLs: {item['merged_urls']}")
+        lines.append(f" Live Hosts: {item['unique_hosts_live']} | Redirect-only Hosts: {item['unique_hosts_redirect_only']}")
+        if item['redirect_only_hosts_sample']:
+            lines.append(f"  Redirect-only sample: {', '.join(item['redirect_only_hosts_sample'])}")
+        ipats = {k:v for k,v in item['interesting_pattern_counts'].items() if v>0}
+        if ipats:
+            lines.append(" Interesting patterns: " + ", ".join(f"{k}:{v}" for k,v in ipats.items()))
+        lines.append(f" Risk Score: {item['risk_score']}")
+        lines.append("")
+    (run_dir / "report.txt").write_text("\n".join(lines))
+    print(f"{Colors.OKCYAN}{Colors.BOLD}Reports written to {run_dir}/report.json and report.txt{Colors.ENDC}")
+
+def main():
+    global extra_header
+    parser = argparse.ArgumentParser(description="Bug bounty wildcard automation script")
+    parser.add_argument("--json", default="assets.json", help="Path to assets JSON file")
+    parser.add_argument("--header", default=None, help="Optional program header (e.g. auth cookie)")
+    parser.add_argument("--workers", type=int, default=3, help="Concurrent domains")
+    parser.add_argument("--keep", action="store_true", help="Keep temp directory (default keeps anyway)")
+    args = parser.parse_args()
+
+    output_root = Path("output")
+    output_root.mkdir(exist_ok=True)
+
+    # Create a dedicated temp run directory
+    run_dir = Path(tempfile.mkdtemp(prefix="bounty_run_", dir=str(output_root)))
+    print(f"{Colors.OKCYAN}Working directory: {run_dir}{Colors.ENDC}")
+
+    if args.header:
+        extra_header = args.header
+
+    with open(args.json, "r") as f:
+        data = json.load(f)
+
+    domains = [
+        entry.get("Asset")
+        for entry in data
+        if entry.get("Type") == "Wildcard"
+        and entry.get("Coverage") == "In scope"
+        and entry.get("Asset")
+    ]
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains}
+        for fut in as_completed(futures):
+            dom = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
+
+    # After all domains processed, generate aggregated reports
+    generate_reports(run_dir)
+
+    print(f"{Colors.OKGREEN}All done. Review report.txt for triage guidance.{Colors.ENDC}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,74 @@
+#!/bin/env python3
+import sys
+import os
+import re
+
+# Extensions and their corresponding output files
+extensions = {
+    r"\.php[3-8]?(\?|$)": "php.txt",             # .php, .php3, .php4, .php5, etc.
+    r"\.phtml(\?|$)": "php.txt",                 # .phtml
+    r"\.cfm(\?|$)": "cfm.txt",
+    r"\.asp(\?|$)": "asp.txt",
+    r"\.aspx(\?|$)": "asp.txt",
+    r"\.asp\.net(\?|$)": "asp.txt",              # .asp.net
+    r"\.jsp(\?|$)": "jsp.txt",
+    r"\.jspx(\?|$)": "jsp.txt",
+    r"\.do(\?|$)": "do.txt",
+    r"\.pl(\?|$)": "pl.txt",
+    r"\.cgi(\?|$)": "cgi.txt",
+    r"\.ashx(\?|$)": "ashx.txt",
+    r"\.jsf(\?|$)": "jsf.txt",
+    r"\.nsf(\?|$)": "nsf.txt",
+    r"\.exe(\?|$)": "exe.txt",
+    r"\.dll(\?|$)": "dll.txt",
+    r"=http": "output_test_ssrf.txt",
+    r"=/": "output_test_lfi.txt",
+    r"/cgi-bin/": "cgibin.txt",
+    r"\.json(ld)?(\?|$)": "json.txt",            # .json, .jsonld
+    r"\.js(\?|$|#)": "js.txt",                   # Strict .js match
+    r"\.xml(\?|$)": "xml.txt",
+    r"\.xhtml(\?|$)": "xml.txt",
+    r"\.action(\?|$)": "action.txt",
+    # login non case sensitive
+    r"(?i)login": "login.txt",
+    r"(?i)admin": "admin.txt",
+    r"(?i)dashboard": "dashboard.txt",
+    r"(?i)portal": "portal.txt",
+    r"(?i)manage": "manage.txt",
+    r"(?i)config": "config.txt",
+    r"(?i)setup": "setup.txt",
+    r"(?i)system": "system.txt",
+    r"(?i)secure": "secure.txt",
+    r"(?i)controlpanel": "controlpanel.txt",
+    r"(?i)cpanel": "cpanel.txt",
+    r"(?i)root": "root.txt",
+    r"token" : "token.txt",
+    r"auth" : "auth.txt",
+    r"session" : "session.txt",
+    r"password" : "password.txt",
+}
+
+# Mkdir for output files
+os.makedirs("sorted_urls", exist_ok=True)
+
+# Remove existing output files to avoid appending to old data
+for filename in extensions.values():
+    filepath = os.path.join("sorted_urls", filename)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+
+with open(sys.argv[1], 'r', encoding='utf-8', errors="ignore") as myfile:
+    # Create output files
+    outputs = {pattern: open(os.path.join("sorted_urls", filename), 'a') for pattern, filename in extensions.items()}
+    for line in myfile:
+        for pattern, file in outputs.items():
+            if re.search(pattern, line):
+                file.write(line)
+                
+
+# Close output files
+for file in outputs.values():
+    file.close()
+
+# Remove empty files
+os.system('find . -size 0 -print -delete')
