@@ -10,6 +10,15 @@ import shutil
 import datetime
 import re
 import idna
+import shlex
+import time
+import random
+from typing import Optional, List, Tuple
+from urllib.parse import urljoin, urlparse
+import sys
+import requests
+import urllib3  # ✅ Add this
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ANSI color codes
 class Colors:
@@ -25,6 +34,395 @@ class Colors:
 
 extra_header = ""
 REDIRECT_CODES = {300,301,302,303,307,308}
+SKIP_GOBUSTER = False
+
+# Gobuster defaults (can be overridden via CLI)
+GOBUSTER_WORDLIST = "/home/mci/ctf/theballmarcus-payloads/wordlists/Web/Endpoints/sensitive_endpoints.txt"
+GOBUSTER_THREADS = 2
+GOBUSTER_PROXY: Optional[str] = None
+
+def enumerate_domains(pretty_httpx_file: Path, base_dir: Path, threads: int, proxy: Optional[str], wordlist: str):
+    """Replicates enumerate_domains_2 bash logic in Python.
+
+    pretty_httpx_file: path to pretty_httpx.txt produced earlier (first column is URL)
+    base_dir: folder for the current wildcard domain processing (where gobuster_results/ will live)
+    threads: gobuster thread count
+    proxy: optional proxy URL (e.g. http://localhost:1340)
+    wordlist: path to wordlist
+    """
+    output_folder = base_dir / "gobuster_results"
+    output_folder.mkdir(exist_ok=True)
+
+    if not pretty_httpx_file.exists():
+        print(f"{Colors.WARNING}enumerate_domains: pretty_httpx file {pretty_httpx_file} missing, skipping{Colors.ENDC}")
+        return
+
+    # Extract first column (space-delimited) into list of URLs
+    targets: List[str] = []
+    seen = set()
+    with pretty_httpx_file.open("r", errors="ignore") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            url = line.split()[0]
+            if url not in seen:
+                seen.add(url)
+                targets.append(url)
+
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/116.0"
+
+    for subdomain in targets:
+        safe_subdomain = re.sub(r'^https?://', '', subdomain).replace('/', '_')
+        output_file = output_folder / f"results_{safe_subdomain}.txt"
+        if output_file.exists() and output_file.stat().st_size > 0:
+            continue  # already scanned
+
+        base_cmd = [
+            "gobuster", "dir",
+            "-u", subdomain,
+            "-t", str(threads),
+            "-w", wordlist,
+            "-o", str(output_file),
+            "-q", "-k", "-d",
+            "-a", ua,
+            "--delay", "3ms"
+        ]
+        if proxy:
+            base_cmd.extend(["--proxy", proxy])
+        if extra_header:
+            base_cmd.extend(["-H", extra_header])
+
+        print(f"{Colors.OKBLUE}{Colors.BOLD}Gobuster:{Colors.ENDC} {subdomain}")
+        try:
+            cp = subprocess.run(base_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if cp.returncode != 0:
+                stderr = cp.stderr or ""
+                # parse lengths from stderr
+                lengths = sorted(set(re.findall(r'Length: (\d+)', stderr)))
+                if lengths:
+                    excl = ",".join(lengths)
+                    print(f"{Colors.WARNING}Wildcard/length issue detected. Re-running excluding lengths: {excl}{Colors.ENDC}")
+                    retry_cmd = base_cmd + ["--exclude-length", excl]
+                    cp2 = subprocess.run(retry_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    if cp2.returncode != 0:
+                        print(f"{Colors.FAIL}Gobuster failed again for {subdomain}: {cp2.stderr.strip()[:200]}{Colors.ENDC}")
+                else:
+                    print(f"{Colors.FAIL}Gobuster failed (no length hints) for {subdomain}: {stderr.strip()[:200]}{Colors.ENDC}")
+            else:
+                print(f"{Colors.OKGREEN}Gobuster complete: {subdomain}{Colors.ENDC}")
+        except FileNotFoundError:
+            print(f"{Colors.FAIL}Gobuster binary not found - skipping enumeration for {subdomain}{Colors.ENDC}")
+            break
+        except Exception as e:
+            print(f"{Colors.FAIL}Gobuster exception for {subdomain}: {e}{Colors.ENDC}")
+
+def sort_urls(input_file: Path, output_dir: Path):
+    # Define patterns and associated output files
+    extensions = {
+        r"\.php[3-8]?(\?|$)": "php.txt",
+        r"\.phtml(\?|$)": "php.txt",
+        r"\.cfm(\?|$)": "cfm.txt",
+        r"\.asp(\?|$)": "asp.txt",
+        r"\.aspx(\?|$)": "asp.txt",
+        r"\.asp\.net(\?|$)": "asp.txt",
+        r"\.jsp(\?|$)": "jsp.txt",
+        r"\.jspx(\?|$)": "jsp.txt",
+        r"\.do(\?|$)": "do.txt",
+        r"\.pl(\?|$)": "pl.txt",
+        r"\.cgi(\?|$)": "cgi.txt",
+        r"\.ashx(\?|$)": "ashx.txt",
+        r"\.jsf(\?|$)": "jsf.txt",
+        r"\.nsf(\?|$)": "nsf.txt",
+        r"\.exe(\?|$)": "exe.txt",
+        r"\.dll(\?|$)": "dll.txt",
+        r"=http": "output_test_ssrf.txt",
+        r"=/": "output_test_lfi.txt",
+        r"/cgi-bin/": "cgibin.txt",
+        r"\.json(ld)?(\?|$)": "json.txt",
+        r"\.js(\?|$|#)": "js.txt",
+        r"\.xml(\?|$)": "xml.txt",
+        r"\.xhtml(\?|$)": "xml.txt",
+        r"\.action(\?|$)": "action.txt",
+        r"(?i)login": "login.txt",
+        r"(?i)admin": "admin.txt",
+        r"(?i)dashboard": "dashboard.txt",
+        r"(?i)portal": "portal.txt",
+        r"(?i)manage": "manage.txt",
+        r"(?i)config": "config.txt",
+        r"(?i)setup": "setup.txt",
+        r"(?i)system": "system.txt",
+        r"(?i)secure": "secure.txt",
+        r"(?i)controlpanel": "controlpanel.txt",
+        r"(?i)cpanel": "cpanel.txt",
+        r"(?i)root": "root.txt",
+        r"token": "token.txt",
+        r"auth": "auth.txt",
+        r"session": "session.txt",
+        r"password": "password.txt",
+        r"localhost|127\.0\.0\.1" : "localhost.txt",
+
+    }
+
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cleanup existing files
+    for filename in set(extensions.values()):
+        filepath = output_dir / filename
+        if filepath.exists():
+            filepath.unlink()
+
+    # Open files for writing
+    outputs = {
+        pattern: open(output_dir / filename, "a", encoding="utf-8", errors="ignore")
+        for pattern, filename in extensions.items()
+    }
+
+    # Read input and sort into buckets
+    with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            for pattern, outfile in outputs.items():
+                if re.search(pattern, line):
+                    outfile.write(line)
+                    break  # Avoid duplicates if multiple patterns match
+
+    # Close all open file handles
+    for outfile in outputs.values():
+        outfile.close()
+
+    # Remove empty files
+    for file in output_dir.glob("*"):
+        if file.stat().st_size == 0:
+            file.unlink()
+
+    # Generate index summary file
+    index_file = output_dir.parent / "sorted_urls.txt"
+    with open(index_file, "w", encoding="utf-8") as f:
+        for file in sorted(output_dir.glob("*.txt")):
+            f.write(f"{file.name} - {file.stat().st_size} bytes\n")
+
+def unmap_with_sourcemapper(map_file: Path, output_dir: Path):
+    """
+    Uses sourcemapper to extract original JS sources from a .map file into output_dir.
+    """
+    if not map_file.exists():
+        print(f"✗ Map file does not exist: {map_file}")
+        return False
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        print(f"✓ Unmapping with sourcemapper: {map_file}")
+        subprocess.run(
+            ["sourcemapper", "-url", str(map_file), "-output", str(output_dir)],
+            check=True,
+            timeout=30
+        )
+        print(f"✓ Unmapped files written to: {output_dir}")
+        return True
+    except FileNotFoundError:
+        print("✗ 'sourcemapper' is not installed. Install it with: go install github.com/denandz/sourcemapper@latest")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"✗ sourcemapper failed: {e}")
+        return False
+    except Exception as e:
+        print(f"✗ Unexpected error during unmapping: {e}")
+        return False
+
+def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
+    js_dir = domain_folder / "js_analysis"
+    js_dir.mkdir(exist_ok=True)
+
+    js_urls = set()
+    # Step 1: extract JS URLs
+    if merged_urls_file.exists():
+        with merged_urls_file.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if ".js" in line and line.strip().startswith("http"):
+                    js_urls.add(line.strip())
+
+    # Step 2: download and analyze JS files
+    secrets_found = {}
+    endpoint_hits = {}
+
+    downloaded_map_files = []
+
+    patterns = {
+        'google_api' : r'AIza[0-9A-Za-z-_]{35}',
+        'docs_file_exetension' : r'^.*\.(xls|xlsx|doc|docx)$',
+        'bitcoin_address' : r'([13][a-km-zA-HJ-NP-Z0-9]{26,33})',
+        'slack_api_key' : r'xox.-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}',
+        'us_cn_zipcode' : r'(^\d{5}(-\d{4})?$)|(^[ABCEGHJKLMNPRSTVXY]{1}\d{1}[A-Z]{1} *\d{1}[A-Z]{1}\d{1}$)',
+        'google_cloud_platform_auth' : r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+        'google_cloud_platform_api' : r'[A-Za-z0-9_]{21}--[A-Za-z0-9_]{8}',
+        'amazon_secret_key' : r'[0-9a-zA-Z/+]{40}',
+        'gmail_auth_token': r'[0-9A-Za-z_-]{32}\.apps\.googleusercontent\.com',
+        'github_auth_token' : r'[0-9a-fA-F]{40}',
+        'Instagram_token' : r'[0-9a-fA-F]{7}.[0-9a-fA-F]{32}',
+        'twitter_access_token': r'[1-9][0-9]+-[0-9a-zA-Z]{40}',
+        'firebase' : r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',
+        'google_captcha' : r'6L[0-9A-Za-z-_]{38}|^6[0-9a-zA-Z_-]{39}$',
+        'google_oauth' : r'ya29\.[0-9A-Za-z\-_]+',
+        'amazon_aws_access_key_id' : r'A[SK]IA[0-9A-Z]{16}',
+        'amazon_mws_auth_toke' : r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+        'amazon_aws_url' : r's3\.amazonaws.com[/]+|[a-zA-Z0-9_-]*\.s3\.amazonaws.com',
+        'facebook_access_token' : r'EAACEdEose0cBA[0-9A-Za-z]+',
+        'authorization_basic' : r'basic\s*[a-zA-Z0-9=:_\+\/-]+',
+        'authorization_bearer' : r'bearer\s*[a-zA-Z0-9_\-\.=:_\+\/]+',
+        'authorization_api' : r'api[key|\s*]+[a-zA-Z0-9_\-]+',
+        'mailgun_api_key' : r'key-[0-9a-zA-Z]{32}',
+        'twilio_api_key' : r'SK[0-9a-fA-F]{32}',
+        'twilio_account_sid' : r'AC[a-zA-Z0-9_\-]{32}',
+        'twilio_app_sid' : r'AP[a-zA-Z0-9_\-]{32}',
+        'paypal_braintree_access_token' : r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',
+        'square_oauth_secret': r'sq0csp-[0-9A-Za-z\-_]{43}|sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}',
+        'square_access_token' : r'sqOatp-[0-9A-Za-z\-_]{22}|EAAA[a-zA-Z0-9]{60}',
+        'stripe_standard_api' : r'sk_live_[0-9a-zA-Z]{24}',
+        'stripe_restricted_api' : r'rk_live_[0-9a-zA-Z]{24}',
+        'github_access_token' : r'[a-zA-Z0-9_-]*:[a-zA-Z0-9_\-]+@github\.com*',
+        'rsa_private_key' : r'-----BEGIN RSA PRIVATE KEY-----',
+        'ssh_dsa_private_key' : r'-----BEGIN DSA PRIVATE KEY-----',
+        'ssh_dc_private_key' : r'-----BEGIN EC PRIVATE KEY-----',
+        'pgp_private_block' : r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+        'json_web_token' : r'ey[A-Za-z0-9_-]*\.[A-Za-z0-9._-]*|ey[A-Za-z0-9_/+-]*\.[A-Za-z0-9._/+-]*',
+        # Wildcard patterns
+        'admin_keyword' : r'admin[a-zA-Z0-9_\-]*',
+        'token_keyword' : r'token[a-zA-Z0-9_\-]*',
+        'password_keyword' : r'passw(or)?d[a-zA-Z0-9_\-]*',
+        'apikey_keyword' : r'api[_-]?key[a-zA-Z0-9_\-]*',
+        'localhost_url' : r'localhost(:[0-9]{1,5})?',
+    }
+
+    # URL_REGEX = r'(?<=(["\'`]))(?:https?:\/\/|\/|\.{1,2}\/)[^\s"\'`<>\\]+(?=\1)'
+    URL_REGEX = r'(https?://[^\s"\'<>]+|(?:\.\.?/|/)[^\s"\'<>]+)'
+
+    # Set of known false-positive patterns to ignore
+    BLOCKLIST_PATTERNS = [
+        r'^/?1999/',
+        r'^/?2000/',
+        r'^/?AppleWebKit/',
+        r'^/?Firefox/',
+        r'^/?px/',
+        r'^/?533/',
+        r'^/?errors/',
+        r'/dot/g',
+        r'/contrast/g',
+    ]
+
+    suspicious_js_keywords = ["app", "main", "bundle", "min", "build", "vue", "react", "angular"]
+
+    for idx, url in enumerate(js_urls):
+        print(f'{Colors.OKBLUE}Analyzing JS URL:{Colors.ENDC} {url}')
+        filename = js_dir / f"{idx}_{url.split('/')[-1].split('?')[0]}"
+        
+        try:
+            time.sleep(0.1 + random.uniform(0, 0.3)) # Sleep to avoid waf 
+            
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4, verify=False)
+            if r.status_code != 200:
+                print(f"  ↳ Skipping, HTTP status {r.status_code}")
+                continue
+
+            def isHtml(r):
+                if re.match(r'^\s*<!DOCTYPE', r.text, re.I):
+                    return True
+                return False
+            
+            if isHtml(r):
+                print("  ↳ Skipping, looks like HTML content")
+                continue
+
+            with open(filename, "wb") as f:
+                f.write(r.content)
+
+            content = r.text
+
+            # ✅ Check for explicit sourcemap comment
+            map_urls_to_try = []
+            source_map_match = re.search(r'//# sourceMappingURL=(.*\.map)', content)
+            if source_map_match:
+                map_urls_to_try.append(urljoin(url, source_map_match.group(1).strip()))
+
+            # ✅ Guess .map files based on filename keywords
+            parsed = urlparse(url)
+            js_filename = Path(parsed.path).name.lower()
+            if any(k in js_filename for k in suspicious_js_keywords):
+                guessed_map_url = url + ".map" if not js_filename.endswith(".map") else url
+                map_urls_to_try.append(guessed_map_url)
+
+            for murl in set(map_urls_to_try):
+                map_filename = filename.with_suffix(filename.suffix + ".map")
+                try:
+                    print(f"  ↳ Attempting to download sourcemap: {murl}")
+
+                    mr = requests.get(murl, headers={"User-Agent": "Mozilla/5.0"}, timeout=4, verify=False)
+                    if mr.status_code == 200 and not isHtml(mr):
+                        with open(map_filename, "wb") as mf:
+                            mf.write(mr.content)
+                        print(f"{Colors.OKGREEN}{Colors.UNDERLINE}  ↳ Downloaded sourcemap to: {map_filename}{Colors.ENDC}")
+                    else:
+                        print(f"  ↳ Failed to download sourcemap, HTTP status {mr.status_code}")
+                        continue
+                    if map_filename.exists() and map_filename.stat().st_size > 0:
+                        downloaded_map_files.append(murl.split('?')[0])
+
+                except subprocess.SubprocessError:
+                    print(f"  ↳ Failed to download .map: {murl}")
+
+
+            file_hits = {}
+            for name, regex in patterns.items():
+                matches = re.findall(regex, content, flags=re.I)
+                if matches:
+                    file_hits[name] = list(set(matches))
+
+            if file_hits:
+                secrets_found[url] = file_hits
+
+            # Optional: save extracted paths (very LinkFinder-lite)
+            endpoints = set()
+            for match in re.findall(URL_REGEX, content):
+                # Apply blocklist filtering
+                if any(re.search(bp, match) for bp in BLOCKLIST_PATTERNS):
+                    continue
+                endpoints.add(match)
+                
+            if endpoints:
+                endpoint_hits[url] = list(endpoints)
+
+        except subprocess.SubprocessError as e:
+            # Print error stack trace
+            print(f"  ↳ Error downloading or processing JS: {e}")
+            continue  # skip failed downloads silently
+        except Exception as e:
+            print(f"  ↳ Unexpected error: {e}")
+            continue
+
+    n_success_mapped_files = 0
+    # Attempt to unmap downloaded .map files
+    for murl in downloaded_map_files:
+        parsed = urlparse(murl)
+        map_filename = js_dir / f"{Path(parsed.path).name}"
+        if map_filename.exists():
+            unmap_output_dir = js_dir / f"unmapped_{map_filename.stem}"
+            if unmap_with_sourcemapper(map_filename, unmap_output_dir):
+                n_success_mapped_files += 1
+    
+    # Save raw output if any found
+    if secrets_found or endpoint_hits:
+        with (js_dir / "secrets.json").open("w") as f:
+            json.dump(secrets_found, f, indent=2)
+        with (js_dir / "endpoints.json").open("w") as f:
+            json.dump(endpoint_hits, f, indent=2)
+
+    return {
+        "js_urls_checked": len(js_urls),
+        "secrets_found": len(secrets_found),
+        "endpoints_extracted": len(endpoint_hits),
+        "dir": js_dir if (secrets_found or endpoint_hits) else None,
+        "sourcemaps_downloaded": n_success_mapped_files
+    }
 
 def run_cmd(cmd, cwd=None, stdout_file=None, allow_empty_stdout=True, timeout=None):
     print(f"{Colors.OKBLUE}{Colors.BOLD}Running:{Colors.ENDC} {Colors.OKCYAN}{cmd}{Colors.ENDC}")
@@ -91,66 +489,100 @@ def process_wildcard(domain, base_dir):
                 txts[0].rename(generated)
 
     # 2: amass merge
-    if not (folder / amass_file).exists():
+    if not (folder / amass_file).exists() and not (folder / alive_subs_file).exists():
         try:
-            run_cmd(f"amass enum -d {ascii_domain} -o {amass_file} -active", cwd=folder)
-            run_cmd(f"cat {subs_file} {amass_file} | sort -u > {subs_file}.tmp && mv {subs_file}.tmp {subs_file}", cwd=folder)
+            run_cmd(f"amass enum -d {ascii_domain} -o {amass_file}", cwd=folder)
+            run_cmd(f"cat {subs_file} {amass_file} | sort -u | dnsx -silent -a -o {alive_subs_file}", cwd=folder)
         except RuntimeError as e:
             print(f"{Colors.WARNING}Amass failed: {e}{Colors.ENDC}")
 
+    # Helper for safe header quoting in shell-based pipelines
+    def hdr():
+        return f" -H {shlex.quote(extra_header)}" if extra_header else ""
+
     # httpx alive subdomains only
-    if not (folder / alive_subs_file).exists():
-        httpx_cmd = f"httpx -silent"
-        if extra_header:
-            httpx_cmd += f" -H '{extra_header}'"
-        run_cmd(f"cat {subs_file} | {httpx_cmd} > {alive_subs_file}", cwd=folder)
+    if (folder / alive_subs_file).exists() and not (folder / f"{alive_subs_file}.services").exists():
+        httpx_cmd = f"httpx -hc -cl -tech-detect -title -silent{hdr()}"
+        run_cmd(f"cat {alive_subs_file} | {httpx_cmd} > {alive_subs_file}.services", cwd=folder)
 
     # 3: gau
     if not (folder / urls_file).exists():
         run_cmd(f"cat {alive_subs_file} | gau > {urls_file}", cwd=folder)
 
-    # 4: httpx alive
-    if not (folder / alive_file).exists():
-        httpx_cmd = f"httpx -silent"
-        if extra_header:
-            httpx_cmd += f" -H '{extra_header}'"
-        run_cmd(f"cat {urls_file} | {httpx_cmd} > {alive_file}", cwd=folder)
-
-    # 5: katana (skip if no alive_urls or empty)
+    # 4: katana (skip if no alive_urls or empty)
     if not (folder / katana_file).exists():
-        if (folder / alive_file).exists() and os.path.getsize(folder / alive_file) > 0:
-            katana_base = f"katana -list {alive_file} -o {katana_file} -d 3 -jc -kf all -silent"
-            if extra_header:
-                katana_base += f" -H '{extra_header}'"
-            # generous timeout (30m previously). Keep 20m.
+        if (folder / alive_subs_file).exists() and os.path.getsize(folder / alive_subs_file) > 0:
+            katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
             run_cmd(f"timeout 20m {katana_base}", cwd=folder, allow_empty_stdout=True)
         else:
             open(folder / katana_file, "w").close()
 
-    # 6: merge URLs
-    if not (folder / merged_urls_file).exists():
-        run_cmd(f"cat {urls_file} {katana_file} | sort -u > {merged_urls_file}", cwd=folder)
+    # 5: Filter unique paths and domains that are not the base_domain variable and merge
+    unique_paths_file = folder / "unique_paths.txt"
+    if not unique_paths_file.exists():
+        with open(folder / urls_file, "r") as infile, open(folder / katana_file, "r") as kfile, open(unique_paths_file, "w") as outfile:
+            seen = set()
+            # Process katana file first (more likely to have deep paths)
+            def process_line(line):
+                path = line.split("?")[0].strip()
+                if path not in seen:
+                    seen.add(path)
+                    try:
+                        parsed = urlparse(line)
+                        host = parsed.hostname or ""
+                        if host.endswith(ascii_domain) or host.endswith(clean_domain):
+                            outfile.write(path + "\n")
+                    except Exception:
+                        print(f"{Colors.WARNING}Invalid URL skipped: {line.strip()}{Colors.ENDC}")
 
-    # 7: classify/sort
+            for line in kfile:
+                process_line(line)
+            for line in infile:
+                process_line(line)
+
+    # 6: httpx alive
+    if not (folder / alive_file).exists():
+        httpx_cmd = f"httpx -silent{hdr()}"
+        run_cmd(f"cat {unique_paths_file.name} | {httpx_cmd} > {alive_file}", cwd=folder)
+
+    # 7: merge URLs
+    # if not (folder / merged_urls_file).exists():
+    #     run_cmd(f"cat {urls_file} {katana_file} | sort -u > {merged_urls_file}", cwd=folder)
+
+    # Optional JS analysis
+    try:
+        js_stats = analyze_js_files(folder, folder / alive_file)
+        if js_stats.get("dir"):
+            print(f"{Colors.OKGREEN}JS analysis found {js_stats['secrets_found']} secrets and {js_stats['endpoints_extracted']} endpoints in {js_stats['js_urls_checked']} JS files.{Colors.ENDC}")
+    except Exception as e:
+        print(f"{Colors.WARNING}JS analysis failed: {e}{Colors.ENDC}")
+
+    # 8: classify/sort
+    sorted_dir = folder / "sorted_urls"
     if not (folder / "sorted_urls.txt").exists():
         try:
-            run_cmd(f"sort_urls {merged_urls_file}", cwd=folder)
-            # create an index file summary for quick check
-            run_cmd("find sorted_urls -type f -maxdepth 1 -printf '%f %s bytes\\n' > sorted_urls.txt", cwd=folder)
-        except RuntimeError as e:
+            sort_urls(folder / alive_file, sorted_dir)
+        except Exception as e:
             print(f"{Colors.WARNING}sort_urls failed: {e}{Colors.ENDC}")
 
-    # 8: pretty httpx per subdomain (tech + status)
-    if not (folder / pretty_httpx).exists():
-        run_cmd(f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}", cwd=folder)
+    # 9: pretty httpx per subdomain (tech + status)
+    if not (folder / pretty_httpx).exists() and (folder / subs_file).exists():
+        run_cmd(
+            f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}{hdr()}",
+            cwd=folder
+        )
 
-    # 9: light sensitive endpoint enumeration (optional, ignore failures)
+    # 10: light sensitive endpoint enumeration (optional, ignore failures)
     try:
-        run_cmd(f"enumerate_domains_2 {pretty_httpx} 2 http://localhost:1340", cwd=folder, allow_empty_stdout=True)
+        if GOBUSTER_WORDLIST and not SKIP_GOBUSTER:
+            enumerate_domains(folder / pretty_httpx, folder, GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST)
     except Exception as e:
-        print(f"{Colors.WARNING}enumerate_domains_2 failed: {e}{Colors.ENDC}")
+        print(f"{Colors.WARNING}Internal gobuster enumeration failed: {e}{Colors.ENDC}")
 
     print(f"{Colors.OKGREEN}Processing for {domain} completed. Temp results in {folder}{Colors.ENDC}")
+
+    # recursively search for empty files to delete and cleanup
+    run_cmd(f"find . -size 0 -print -delete", cwd=folder, allow_empty_stdout=True)
 
 def parse_pretty_httpx(path: Path):
     results = []
@@ -261,6 +693,31 @@ def analyze_domain(domain_dir: Path):
     score += (len(live_hosts) - len(redirect_only_hosts)) * 0.2
     score = round(score,2)
 
+    # JS analysis stats
+    js_dir = domain_dir / "js_analysis"
+    js_stats = {"js_urls_checked": 0, "secrets_found": 0, "endpoints_extracted": 0}
+    if js_dir.exists():
+        secrets_file = js_dir / "secrets.json"
+        endpoints_file = js_dir / "endpoints.json"
+        if secrets_file.exists():
+            with open(secrets_file) as f:
+                data = json.load(f)
+                js_stats["secrets_found"] = len(data)
+        if endpoints_file.exists():
+            with open(endpoints_file) as f:
+                data = json.load(f)
+                js_stats["endpoints_extracted"] = len(data)
+        js_stats["js_urls_checked"] = len(list(js_dir.glob("js_*.js")))
+        # Count sourcemaps if any
+        js_stats["sourcemaps_downloaded"] = sum(1 for d in js_dir.glob("unmapped_*") if d.is_dir())
+
+    # Add to score (optional)
+    if js_stats["secrets_found"] > 0:
+        score += 3
+    if js_stats["endpoints_extracted"] > 0:
+        score += 1
+
+
     return {
         "domain": domain,
         "subdomains_total": subs_count,
@@ -271,6 +728,7 @@ def analyze_domain(domain_dir: Path):
         "redirect_only_hosts_sample": redirect_only_hosts[:10],
         "interesting_pattern_counts": pattern_hits,
         "sorted_category_counts": sorted_counts,
+        "js_analysis": js_stats,
         "risk_score": score
     }
 
@@ -306,6 +764,10 @@ def generate_reports(run_dir: Path):
         lines.append(f" Live Hosts: {item['unique_hosts_live']} | Redirect-only Hosts: {item['unique_hosts_redirect_only']}")
         if item['redirect_only_hosts_sample']:
             lines.append(f"  Redirect-only sample: {', '.join(item['redirect_only_hosts_sample'])}")
+        if item.get("js_analysis"):
+            js = item["js_analysis"]
+            lines.append(f" JS: Checked {js['js_urls_checked']} files | Secrets: {js['secrets_found']} | Endpoints: {js['endpoints_extracted']}")
+
         ipats = {k:v for k,v in item['interesting_pattern_counts'].items() if v>0}
         if ipats:
             lines.append(" Interesting patterns: " + ", ".join(f"{k}:{v}" for k,v in ipats.items()))
@@ -316,22 +778,43 @@ def generate_reports(run_dir: Path):
 
 def main():
     global extra_header
+    global GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST, SKIP_GOBUSTER
     parser = argparse.ArgumentParser(description="Bug bounty wildcard automation script")
     parser.add_argument("--json", default="assets.json", help="Path to assets JSON file")
     parser.add_argument("--header", default=None, help="Optional program header (e.g. auth cookie)")
     parser.add_argument("--workers", type=int, default=3, help="Concurrent domains")
     parser.add_argument("--keep", action="store_true", help="Keep temp directory (default keeps anyway)")
+    parser.add_argument("--gobuster-threads", type=int, default=2, help="Threads for gobuster (enumeration phase)")
+    parser.add_argument("--gobuster-proxy", default=None, help="Optional proxy for gobuster (e.g. http://localhost:1340)")
+    parser.add_argument("--gobuster-wordlist", default=GOBUSTER_WORDLIST, help="Wordlist for gobuster directory enumeration")
+    parser.add_argument("--skip-gobuster", action="store_true", help="Skip gobuster enumeration phase")
+    parser.add_argument("--use-existing-dir", default=None, help="Use an existing run directory instead of creating a new temp one")
     args = parser.parse_args()
 
-    output_root = Path("output")
-    output_root.mkdir(exist_ok=True)
+    if args.use_existing_dir:
+        run_dir = Path(args.use_existing_dir)
+        if not run_dir.exists() or not run_dir.is_dir():
+            print(f"{Colors.FAIL}Provided existing directory does not exist or is not a directory: {run_dir}{Colors.ENDC}")
+            sys.exit(1)
+        print(f"{Colors.OKCYAN}Using existing run directory: {run_dir}{Colors.ENDC}")
+    else:
+        output_root = Path("output")
+        output_root.mkdir(exist_ok=True)
 
     # Create a dedicated temp run directory
-    run_dir = Path(tempfile.mkdtemp(prefix="bounty_run_", dir=str(output_root)))
+        run_dir = Path(tempfile.mkdtemp(prefix="bounty_run_", dir=str(output_root)))
+    # Tmp rundir to test flow
+    # run_dir = output_root / "bounty_run_83mtoyth"
+
     print(f"{Colors.OKCYAN}Working directory: {run_dir}{Colors.ENDC}")
 
     if args.header:
         extra_header = args.header
+
+    # Apply gobuster settings
+    GOBUSTER_THREADS = args.gobuster_threads
+    GOBUSTER_PROXY = args.gobuster_proxy
+    GOBUSTER_WORDLIST = args.gobuster_wordlist
 
     with open(args.json, "r") as f:
         data = json.load(f)
@@ -344,6 +827,8 @@ def main():
         and entry.get("Asset")
     ]
 
+    SKIP_GOBUSTER = args.skip_gobuster
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains}
         for fut in as_completed(futures):
@@ -354,9 +839,11 @@ def main():
                 print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
 
     # After all domains processed, generate aggregated reports
+    print(f'{Colors.HEADER}{Colors.BOLD}Generating reports...{Colors.ENDC}')
     generate_reports(run_dir)
 
     print(f"{Colors.OKGREEN}All done. Review report.txt for triage guidance.{Colors.ENDC}")
+
 
 if __name__ == "__main__":
     main()
