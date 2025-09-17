@@ -17,7 +17,10 @@ from typing import Optional, List, Tuple
 from urllib.parse import urljoin, urlparse
 import sys
 import requests
-import urllib3  # ✅ Add this
+import urllib3 
+import traceback
+import hashlib
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ANSI color codes
@@ -251,18 +254,18 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
     patterns = {
         'google_api' : r'AIza[0-9A-Za-z-_]{35}',
         'docs_file_exetension' : r'^.*\.(xls|xlsx|doc|docx)$',
-        'bitcoin_address' : r'([13][a-km-zA-HJ-NP-Z0-9]{26,33})',
+        #'bitcoin_address' : r'([13][a-km-zA-HJ-NP-Z0-9]{26,33})',
         'slack_api_key' : r'xox.-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}',
         'us_cn_zipcode' : r'(^\d{5}(-\d{4})?$)|(^[ABCEGHJKLMNPRSTVXY]{1}\d{1}[A-Z]{1} *\d{1}[A-Z]{1}\d{1}$)',
         'google_cloud_platform_auth' : r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
         'google_cloud_platform_api' : r'[A-Za-z0-9_]{21}--[A-Za-z0-9_]{8}',
-        'amazon_secret_key' : r'[0-9a-zA-Z/+]{40}',
+        #'amazon_secret_key' : r'[0-9a-zA-Z/+]{40}',
         'gmail_auth_token': r'[0-9A-Za-z_-]{32}\.apps\.googleusercontent\.com',
         'github_auth_token' : r'[0-9a-fA-F]{40}',
         'Instagram_token' : r'[0-9a-fA-F]{7}.[0-9a-fA-F]{32}',
         'twitter_access_token': r'[1-9][0-9]+-[0-9a-zA-Z]{40}',
         'firebase' : r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',
-        'google_captcha' : r'6L[0-9A-Za-z-_]{38}|^6[0-9a-zA-Z_-]{39}$',
+        #'google_captcha' : r'6L[0-9A-Za-z-_]{38}|^6[0-9a-zA-Z_-]{39}$',
         'google_oauth' : r'ya29\.[0-9A-Za-z\-_]+',
         'amazon_aws_access_key_id' : r'A[SK]IA[0-9A-Z]{16}',
         'amazon_mws_auth_toke' : r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
@@ -273,8 +276,8 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
         'authorization_api' : r'api[key|\s*]+[a-zA-Z0-9_\-]+',
         'mailgun_api_key' : r'key-[0-9a-zA-Z]{32}',
         'twilio_api_key' : r'SK[0-9a-fA-F]{32}',
-        'twilio_account_sid' : r'AC[a-zA-Z0-9_\-]{32}',
-        'twilio_app_sid' : r'AP[a-zA-Z0-9_\-]{32}',
+        #'twilio_account_sid' : r'AC[a-zA-Z0-9_\-]{32}',
+        #'twilio_app_sid' : r'AP[a-zA-Z0-9_\-]{32}',
         'paypal_braintree_access_token' : r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',
         'square_oauth_secret': r'sq0csp-[0-9A-Za-z\-_]{43}|sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}',
         'square_access_token' : r'sqOatp-[0-9A-Za-z\-_]{22}|EAAA[a-zA-Z0-9]{60}',
@@ -285,17 +288,18 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
         'ssh_dsa_private_key' : r'-----BEGIN DSA PRIVATE KEY-----',
         'ssh_dc_private_key' : r'-----BEGIN EC PRIVATE KEY-----',
         'pgp_private_block' : r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
-        'json_web_token' : r'ey[A-Za-z0-9_-]*\.[A-Za-z0-9._-]*|ey[A-Za-z0-9_/+-]*\.[A-Za-z0-9._/+-]*',
+        'json_web_token' : r'ey[I|J][A-Za-z0-9_-]*\.[A-Za-z0-9._-]*|ey[A-Za-z0-9_/+-]*\.[A-Za-z0-9._/+-]*',
         # Wildcard patterns
-        'admin_keyword' : r'admin[a-zA-Z0-9_\-]*',
-        'token_keyword' : r'token[a-zA-Z0-9_\-]*',
-        'password_keyword' : r'passw(or)?d[a-zA-Z0-9_\-]*',
-        'apikey_keyword' : r'api[_-]?key[a-zA-Z0-9_\-]*',
+        # 'admin_keyword' : r'admin[a-zA-Z0-9_\-]*',
+        # 'token_keyword' : r'token[a-zA-Z0-9_\-]*',
+        # 'password_keyword' : r'passw(or)?d[a-zA-Z0-9_\-]*',
+        # 'apikey_keyword' : r'api[_-]?key[a-zA-Z0-9_\-]*',
         'localhost_url' : r'localhost(:[0-9]{1,5})?',
+        'emails' : r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
     }
 
     # URL_REGEX = r'(?<=(["\'`]))(?:https?:\/\/|\/|\.{1,2}\/)[^\s"\'`<>\\]+(?=\1)'
-    URL_REGEX = r'(https?://[^\s"\'<>]+|(?:\.\.?/|/)[^\s"\'<>]+)'
+    URL_REGEX = r'["\']((?:https?://[\w\-./?=#&%]+)|(?:(?:\.\.?/|/)?[\w\-./]+\.[a-zA-Z]{2,6}(?:\?[\w\-./?=#&%]*)?)|(?:(?:\.\.?/|/)[\w\-./]+))["\']'
 
     # Set of known false-positive patterns to ignore
     BLOCKLIST_PATTERNS = [
@@ -308,24 +312,49 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
         r'^/?errors/',
         r'/dot/g',
         r'/contrast/g',
+        r'^//$'
     ]
 
     suspicious_js_keywords = ["app", "main", "bundle", "min", "build", "vue", "react", "angular"]
 
+    IGNORE_JS_FILES= [
+        r"jquery[-\d\.]*\.js",
+        r"jquery[-\d\.]*\.min.js",
+        r"bootstrap[-\d\.]*\.js",
+        r"bootstrap[-\d\.]*\.min\.js",
+        r"purify\.js",
+        r"purify\.min\.js",
+        r"favico\.min\.js"
+    ]
+
+    md5_ignore = set()
+
     for idx, url in enumerate(js_urls):
+        
         print(f'{Colors.OKBLUE}Analyzing JS URL:{Colors.ENDC} {url}')
         filename = js_dir / f"{idx}_{url.split('/')[-1].split('?')[0]}"
         
+        if any(re.fullmatch(ign, filename.name, re.IGNORECASE) for ign in IGNORE_JS_FILES):
+            with open('ignored_js_files.txt', 'ab') as f:
+                f.write((f"{url}\n").encode())
+            continue
+
         try:
             time.sleep(0.1 + random.uniform(0, 0.3)) # Sleep to avoid waf 
             
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4, verify=False)
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0", extra_header.split(':')[0]: extra_header.split(':')[1][1:]}, timeout=4, verify=False)
             if r.status_code != 200:
                 print(f"  ↳ Skipping, HTTP status {r.status_code}")
                 continue
-
+            
+            file_hash = hashlib.md5(r.content).hexdigest()
+            if file_hash in md5_ignore:
+                print(f"  ↳ Skipping, duplicate content (MD5: {file_hash})")
+                continue
+            md5_ignore.add(file_hash)
+            
             def isHtml(r):
-                if re.match(r'^\s*<!DOCTYPE', r.text, re.I):
+                if re.match(r'(?i)^\s*<!DOCTYPE|<html', r.text, re.I):
                     return True
                 return False
             
@@ -334,21 +363,21 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
                 continue
 
             with open(filename, "wb") as f:
+                f.write(f"// Source: {url}\n".encode())
                 f.write(r.content)
 
             content = r.text
 
-            # ✅ Check for explicit sourcemap comment
+            # Check for explicit sourcemap comment
             map_urls_to_try = []
             source_map_match = re.search(r'//# sourceMappingURL=(.*\.map)', content)
             if source_map_match:
                 map_urls_to_try.append(urljoin(url, source_map_match.group(1).strip()))
-
-            # ✅ Guess .map files based on filename keywords
+            
+            # Rewrite snippet above because it doesnt work
             parsed = urlparse(url)
-            js_filename = Path(parsed.path).name.lower()
-            if any(k in js_filename for k in suspicious_js_keywords):
-                guessed_map_url = url + ".map" if not js_filename.endswith(".map") else url
+            if any(k in parsed.path.lower() for k in suspicious_js_keywords):
+                guessed_map_url = url + ".map" if not parsed.path.lower().endswith(".map") else url
                 map_urls_to_try.append(guessed_map_url)
 
             for murl in set(map_urls_to_try):
@@ -356,7 +385,7 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
                 try:
                     print(f"  ↳ Attempting to download sourcemap: {murl}")
 
-                    mr = requests.get(murl, headers={"User-Agent": "Mozilla/5.0"}, timeout=4, verify=False)
+                    mr = requests.get(murl, headers={"User-Agent": "Mozilla/5.0", extra_header.split(':')[0]: extra_header.split(':')[1][1:] }, timeout=4, verify=False)
                     if mr.status_code == 200 and not isHtml(mr):
                         with open(map_filename, "wb") as mf:
                             mf.write(mr.content)
@@ -365,7 +394,7 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
                         print(f"  ↳ Failed to download sourcemap, HTTP status {mr.status_code}")
                         continue
                     if map_filename.exists() and map_filename.stat().st_size > 0:
-                        downloaded_map_files.append(murl.split('?')[0])
+                        downloaded_map_files.append(map_filename)
 
                 except subprocess.SubprocessError:
                     print(f"  ↳ Failed to download .map: {murl}")
@@ -400,12 +429,11 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
             continue
 
     n_success_mapped_files = 0
+    
     # Attempt to unmap downloaded .map files
-    for murl in downloaded_map_files:
-        parsed = urlparse(murl)
-        map_filename = js_dir / f"{Path(parsed.path).name}"
+    for map_filename in downloaded_map_files:
         if map_filename.exists():
-            unmap_output_dir = js_dir / f"unmapped_{map_filename.stem}"
+            unmap_output_dir = js_dir / f"unmapped_{map_filename.name}"
             if unmap_with_sourcemapper(map_filename, unmap_output_dir):
                 n_success_mapped_files += 1
     
@@ -415,6 +443,10 @@ def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
             json.dump(secrets_found, f, indent=2)
         with (js_dir / "endpoints.json").open("w") as f:
             json.dump(endpoint_hits, f, indent=2)
+
+    # Check if js_analysis dir has any files - if not, remove it
+    if js_dir.exists() and not any(js_dir.iterdir()):
+        js_dir.rmdir()
 
     return {
         "js_urls_checked": len(js_urls),
@@ -513,7 +545,13 @@ def process_wildcard(domain, base_dir):
     if not (folder / katana_file).exists():
         if (folder / alive_subs_file).exists() and os.path.getsize(folder / alive_subs_file) > 0:
             katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
-            run_cmd(f"timeout 20m {katana_base}", cwd=folder, allow_empty_stdout=True)
+            try:
+                run_cmd(f"timeout 30m {katana_base}", cwd=folder, allow_empty_stdout=True)
+
+            except RuntimeError as e:
+                print(f"{Colors.WARNING}Katana failed or timed out: {e}{Colors.ENDC}")
+                if not (folder / katana_file).exists():
+                    open(folder / katana_file, "w").close()
         else:
             open(folder / katana_file, "w").close()
 
@@ -641,8 +679,8 @@ def analyze_domain(domain_dir: Path):
     sorted_dir = domain_dir / "sorted_urls"
 
     subs_count = sum(1 for _ in open(subs_file)) if subs_file.exists() else 0
-    alive_count = sum(1 for _ in open(alive_file)) if alive_file.exists() else 0
-    merged_count = sum(1 for _ in open(merged_urls_file)) if merged_urls_file.exists() else 0
+    alive_count = sum(1 for _ in open(alive_file, 'rb')) if alive_file.exists() else 0
+    merged_count = sum(1 for _ in open(merged_urls_file, 'rb')) if merged_urls_file.exists() else 0
 
     httpx_entries = parse_pretty_httpx(pretty_httpx)
     redirect_only_hosts = []
@@ -737,9 +775,11 @@ def generate_reports(run_dir: Path):
     for d in run_dir.iterdir():
         if d.is_dir() and (d / f"{d.name}.txt").exists():
             try:
+                print(d)
                 report_items.append(analyze_domain(d))
             except Exception as e:
                 print(f"{Colors.WARNING}Report analysis failed for {d.name}: {e}{Colors.ENDC}")
+                traceback.print_exc()
 
     report_items.sort(key=lambda x: x["risk_score"], reverse=True)
     summary = {
@@ -789,6 +829,7 @@ def main():
     parser.add_argument("--gobuster-wordlist", default=GOBUSTER_WORDLIST, help="Wordlist for gobuster directory enumeration")
     parser.add_argument("--skip-gobuster", action="store_true", help="Skip gobuster enumeration phase")
     parser.add_argument("--use-existing-dir", default=None, help="Use an existing run directory instead of creating a new temp one")
+    parser.add_argument("--specific-domain", default=None, help="For testing: process only this specific domain from the JSON")
     args = parser.parse_args()
 
     if args.use_existing_dir:
@@ -829,14 +870,14 @@ def main():
 
     SKIP_GOBUSTER = args.skip_gobuster
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains}
-        for fut in as_completed(futures):
-            dom = futures[fut]
-            try:
-                fut.result()
-            except Exception as e:
-                print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
+    # with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    #     futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains if (not args.specific_domain) or (d == args.specific_domain)}
+    #     for fut in as_completed(futures):
+    #         dom = futures[fut]
+    #         try:
+    #             fut.result()
+    #         except Exception as e:
+    #             print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
 
     # After all domains processed, generate aggregated reports
     print(f'{Colors.HEADER}{Colors.BOLD}Generating reports...{Colors.ENDC}')
