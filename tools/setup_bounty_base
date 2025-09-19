@@ -20,6 +20,7 @@ import requests
 import urllib3 
 import traceback
 import hashlib
+import dns.resolver
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -44,6 +45,108 @@ GOBUSTER_WORDLIST = "/home/mci/ctf/theballmarcus-payloads/wordlists/Web/Endpoint
 GOBUSTER_THREADS = 2
 GOBUSTER_PROXY: Optional[str] = None
 
+KNOWN_TECHS = {
+    "wordpress": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "wordpress"
+    },
+    "drupal": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "drupal"
+    },
+    "joomla": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "joomla"
+    },
+    "magento": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "magento"
+    },
+    "shopify": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "shopify"
+    },
+    "prestashop": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "prestashop"
+    },
+    "laravel": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "laravel"
+    },
+    "django": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "django"
+    },
+    "rails": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "rails"
+    },
+    "express": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "express"
+    },
+    "tomcat": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "tomcat"
+    },
+    "jboss": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "jboss"
+    },
+    "weblogic": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "weblogic"
+    },
+    "glassfish": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "glassfish"
+    },
+    "oracle": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "oracle"
+    },
+    "iis": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "iis"
+    },
+    "apache": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "apache"
+    },
+    "nginx": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "nginx"
+    },
+    "matomo": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "matomo"
+    },
+    "cisco": {
+        "nuclei_templates": "",
+        "nuclei_cves": "",
+        "nuclei_tags": "cisco"
+    }
+}
 def enumerate_domains(pretty_httpx_file: Path, base_dir: Path, threads: int, proxy: Optional[str], wordlist: str):
     """Replicates enumerate_domains_2 bash logic in Python.
 
@@ -487,7 +590,12 @@ def run_cmd(cmd, cwd=None, stdout_file=None, allow_empty_stdout=True, timeout=No
         if not wrote_output and not allow_empty_stdout:
             raise RuntimeError(f"No stdout produced by: {cmd}")
 
+def hdr():
+    return f" -H {shlex.quote(extra_header)}" if extra_header else ""
+
 def process_wildcard(domain, base_dir):
+
+
     print(f"{Colors.HEADER}{Colors.BOLD}Processing: {domain}{Colors.ENDC}")
     clean_domain = domain.replace("*.", "").strip()
     try:
@@ -512,10 +620,8 @@ def process_wildcard(domain, base_dir):
     if not (folder / subs_file).exists():
         run_cmd(f"findomain -t {ascii_domain} -r -o", cwd=folder)
 
-        # findomain names the file <domain>.txt in current dir already; ensure rename if mismatch
         generated = folder / f"{ascii_domain}.txt"
         if not generated.exists():
-            # fallback: move first *.txt if ambiguous
             txts = list(folder.glob("*.txt"))
             if txts:
                 txts[0].rename(generated)
@@ -528,10 +634,6 @@ def process_wildcard(domain, base_dir):
         except RuntimeError as e:
             print(f"{Colors.WARNING}Amass failed: {e}{Colors.ENDC}")
 
-    # Helper for safe header quoting in shell-based pipelines
-    def hdr():
-        return f" -H {shlex.quote(extra_header)}" if extra_header else ""
-
     # httpx alive subdomains only
     if (folder / alive_subs_file).exists() and not (folder / f"{alive_subs_file}.services").exists():
         httpx_cmd = f"httpx -hc -cl -tech-detect -title -silent{hdr()}"
@@ -541,7 +643,7 @@ def process_wildcard(domain, base_dir):
     if not (folder / urls_file).exists():
         run_cmd(f"cat {alive_subs_file} | gau > {urls_file}", cwd=folder)
 
-    # 4: katana (skip if no alive_urls or empty)
+    # 4: katana
     if not (folder / katana_file).exists():
         if (folder / alive_subs_file).exists() and os.path.getsize(folder / alive_subs_file) > 0:
             katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
@@ -560,7 +662,6 @@ def process_wildcard(domain, base_dir):
     if not unique_paths_file.exists():
         with open(folder / urls_file, "r") as infile, open(folder / katana_file, "r") as kfile, open(unique_paths_file, "w") as outfile:
             seen = set()
-            # Process katana file first (more likely to have deep paths)
             def process_line(line):
                 path = line.split("?")[0].strip()
                 if path not in seen:
@@ -583,11 +684,7 @@ def process_wildcard(domain, base_dir):
         httpx_cmd = f"httpx -silent{hdr()}"
         run_cmd(f"cat {unique_paths_file.name} | {httpx_cmd} > {alive_file}", cwd=folder)
 
-    # 7: merge URLs
-    # if not (folder / merged_urls_file).exists():
-    #     run_cmd(f"cat {urls_file} {katana_file} | sort -u > {merged_urls_file}", cwd=folder)
-
-    # Optional JS analysis
+    # 7: JS analyzsis
     try:
         js_stats = analyze_js_files(folder, folder / alive_file)
         if js_stats.get("dir"):
@@ -619,9 +716,54 @@ def process_wildcard(domain, base_dir):
 
     print(f"{Colors.OKGREEN}Processing for {domain} completed. Temp results in {folder}{Colors.ENDC}")
 
-    # recursively search for empty files to delete and cleanup
     run_cmd(f"find . -size 0 -print -delete", cwd=folder, allow_empty_stdout=True)
 
+def process_url(url, base_dir):
+    print(f"{Colors.HEADER}{Colors.BOLD}Processing URL: {url}{Colors.ENDC}")
+    parsed = urlparse(url)
+    folder = base_dir / "urls"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    if "http" in url.lower() or "/" in url or "'" in url:
+        print(f"{Colors.FAIL}Dangerous input. Please no protocols in the input{Colors.ENDC}")
+        return
+    
+    urlFile = f"{url}.txt"
+    nucleiFile = f"{url}_nuclei.txt"
+    # List of known techs for nuclei scan templates 
+
+    # Step 1: httpx tech detect and alive
+    if not (folder / urlFile).exists():
+        httpx_cmd = f"httpx -silent -title -status-code -content-length -tech-detect -nc {hdr()}"
+        run_cmd(f"echo '{shlex.quote(url)}' | {httpx_cmd} > {urlFile}", cwd=folder)
+    
+    # Step 2: nuclei scan based on techs
+    if (folder / urlFile).exists() and (folder / urlFile).stat().st_size > 0 and not (folder / nucleiFile).exists():
+        techs = set()
+        schemes = set()
+        with open(folder / urlFile, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("https://"):
+                    schemes.add("https://")
+                elif line.startswith("http://"):
+                    schemes.add("http://")
+
+                tech_matches = re.findall(r"\[.+?\]", line)
+                for tech in KNOWN_TECHS:
+                    for attempt_tech in tech_matches:
+                        if tech.lower() in attempt_tech.lower():
+                            techs.add(tech)
+        if techs:
+            nuclei_tags = ",".join(tech for tech in techs)
+            # TODO: implement nuclei cve's and other options
+            print(f"{Colors.OKBLUE}{Colors.BOLD}Nuclei scan for {url} with techs: {', '.join(techs)}{Colors.ENDC}")
+            nuclei_urls = ",".join(f"{scheme}{url}" for scheme in schemes)
+            nuclei_command = f"nuclei -u {nuclei_urls} -o {nucleiFile} --tags default,{nuclei_tags}{hdr()}"
+            print(nuclei_command)
+            run_cmd(nuclei_command, cwd=folder, allow_empty_stdout=True)
+        else:
+            print(f"{Colors.WARNING}No known techs detected for nuclei scan on {url}{Colors.ENDC}")
+    
 def parse_pretty_httpx(path: Path):
     results = []
     if not path.exists():
@@ -830,6 +972,8 @@ def main():
     parser.add_argument("--skip-gobuster", action="store_true", help="Skip gobuster enumeration phase")
     parser.add_argument("--use-existing-dir", default=None, help="Use an existing run directory instead of creating a new temp one")
     parser.add_argument("--specific-domain", default=None, help="For testing: process only this specific domain from the JSON")
+    parser.add_argument("--only-urls", action="store_true", help="Process only URLs from the JSON, skip wildcards")
+    parser.add_argument("--only-wildcards", action="store_true")
     args = parser.parse_args()
 
     if args.use_existing_dir:
@@ -842,24 +986,24 @@ def main():
         output_root = Path("output")
         output_root.mkdir(exist_ok=True)
 
-    # Create a dedicated temp run directory
         run_dir = Path(tempfile.mkdtemp(prefix="bounty_run_", dir=str(output_root)))
-    # Tmp rundir to test flow
-    # run_dir = output_root / "bounty_run_83mtoyth"
 
     print(f"{Colors.OKCYAN}Working directory: {run_dir}{Colors.ENDC}")
 
     if args.header:
         extra_header = args.header
 
-    # Apply gobuster settings
     GOBUSTER_THREADS = args.gobuster_threads
     GOBUSTER_PROXY = args.gobuster_proxy
     GOBUSTER_WORDLIST = args.gobuster_wordlist
 
-    with open(args.json, "r") as f:
-        data = json.load(f)
-
+    try:
+        with open(args.json, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f'{Colors.FAIL}Please provide an existing JSON assets file{Colors.ENDC}')
+        return
+    
     domains = [
         entry.get("Asset")
         for entry in data
@@ -868,16 +1012,33 @@ def main():
         and entry.get("Asset")
     ]
 
-    SKIP_GOBUSTER = args.skip_gobuster
+    urls = [
+        entry.get("Asset")
+        for entry in data
+        if entry.get("Type") == "URL"
+        and entry.get("Coverage") == "In scope"
+        and entry.get("Asset")
+    ]
 
-    # with ThreadPoolExecutor(max_workers=args.workers) as executor:
-    #     futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains if (not args.specific_domain) or (d == args.specific_domain)}
-    #     for fut in as_completed(futures):
-    #         dom = futures[fut]
-    #         try:
-    #             fut.result()
-    #         except Exception as e:
-    #             print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
+    SKIP_GOBUSTER = args.skip_gobuster
+    if not args.only_wildcards:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(process_url, u, run_dir): u for u in urls}
+            for fut in as_completed(futures):
+                url = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"{Colors.FAIL}{Colors.BOLD}URL {url} failed: {e}{Colors.ENDC}")
+    if not args.only_urls:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains if (not args.specific_domain) or (d == args.specific_domain)}
+            for fut in as_completed(futures):
+                dom = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
 
     # After all domains processed, generate aggregated reports
     print(f'{Colors.HEADER}{Colors.BOLD}Generating reports...{Colors.ENDC}')
